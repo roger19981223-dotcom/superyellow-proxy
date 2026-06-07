@@ -1028,8 +1028,9 @@ func (srv *Server) hs(cn net.Conn) {
 func (srv *Server) fdl(s *Session) {
 	defer func() {
 		s.wg.Done()
-		s.ic.Store(true)
-		close(s.cc)
+		if s.ic.CompareAndSwap(false, true) {
+			close(s.cc)
+		}
 		s.Close() // Close all streams + FEC, force RST/FIN to client
 	}()
 	
