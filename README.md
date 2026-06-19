@@ -4,17 +4,19 @@
 
 ## 简介
 
-SuperYellow Proxy 是一个基于 VLESS 协议的隧道代理，支持多 TCP 流并行复用与自适应 FEC 纠错，适用于弱网环境下的稳定翻墙。
+SuperYellow Proxy 是一个基于 WebSocket 的隧道代理，通过 6 条 TCP 流并行传输 + 自适应 FEC 纠错 + uTLS 指纹伪装，实现弱网环境下的稳定翻墙访问。客户端提供 SOCKS5 / HTTP CONNECT 代理入口，兼容 PassWall、Xray、SagerNet 等主流工具。
 
 ## 特性
 
-- **多 TCP 流并行复用** — 6 条 TCP 流并行传输，提升吞吐量
-- **自适应 FEC 纠错** — 根据丢包率自动调整冗余度，弱网下保持可用
-- **uTLS 指纹伪装** — TLS 握手与正常浏览器完全一致
-- **SNI Demux 路由** — 基于 SNI 的流量分发，非 Aether 流量返回正常网页
-- **VLESS 协议透传** — 兼容 xray VLESS，支持 Mux.cool 多路复用
-- **单流自愈** — 单条流故障自动隔离，其余流继续工作
-- **僵尸会话清理** — 自动检测并清理死连接
+- **6 条 TCP 流并行** — 多流复用提升吞吐，单一流故障自动隔离
+- **自适应 FEC 纠错** — 动态调整冗余比率（6 流→5+1，5 流→4+2，<3 流→1+2），弱网下保持可用
+- **分离控制/数据通道** — 控制帧走 1+2 FEC 快车道（`FastLaneFlag`），数据帧走 5+1 FEC，互不污染
+- **类型 6 FIN 帧** — 优雅 EOF，确保数据顺序写入后再关闭连接，不再丢包
+- **uTLS 指纹伪装** — TLS 握手与浏览器完全一致，SNI demux 回落到正常网页
+- **SOCKS5 / HTTP CONNECT** — 标准代理协议，支持 UDP ASSOCIATE
+- **单流自愈 + 退避重连** — 故障流自动替换，全断时指数退避重连（2s→30s）
+- **低日志噪音** — 默认关闭连接级 debug 日志，CMD3 Mux 限频告警
+- **N100 性能优化** — GC=200%、64MB 重组缓冲、5×MSS 读取窗口
 
 ## 下载
 
@@ -92,7 +94,7 @@ systemctl start aether-server
 superyellow-windows-amd64.exe
 ```
 
-浏览器打开 `http://127.0.0.1:8899` 配置服务器信息。
+浏览器打开 `http://127.0.0.1:9999` 配置服务器信息。
 
 ### iStoreOS/OpenWrt 路由器
 
@@ -101,14 +103,13 @@ superyellow-windows-amd64.exe
    ```bash
    sh /tmp/SuperYellow_Client_v1.2.2_x86_64.run
    ```
-3. 打开 Web 面板 `http://<路由器IP>:8899`，填入服务器信息
+3. 打开 Web 面板 `http://<路由器IP>:9999`，填入服务器信息
 4. 在 PassWall 中添加节点：
    - 类型：Xray
-   - 协议：VLESS
+   - 协议：SOCKS5
    - 地址：`127.0.0.1`
-   - 端口：`11081`
-   - 加密：none
-   - TLS：关闭
+   - 端口：`11080`
+   - 关闭 Mux（Aether 自带多路复用，嵌套 Mux 会断网）
 5. 在 PassWall 中切换到 SuperYellow 节点
 
 ### Android
@@ -142,14 +143,19 @@ superyellow-windows-amd64.exe
 | 参数 | 值 |
 |------|-----|
 | TCP 流数量 | 6 |
-| FEC 数据分片 | 4 |
-| FEC 校验分片 | 1 |
+| FEC 动态策略 | 6→5+1, 5→4+2, <3→1+2 |
+| 数据通道 FEC | 5+1 (5 数据 + 1 校验) |
+| 控制通道 FEC | 1+2 (任意 1/3 可恢复) |
 | TLS 版本 | 1.3 |
-| ALPN | h2, http/1.1 |
-| VLESS 端口 | 11081 (客户端) |
-| Web 面板端口 | 8899 (客户端) |
+| ALPN | http/1.1 |
+| 客户端代理端口 | 11080 (SOCKS5/HTTP) |
+| 客户端面板端口 | 9999 |
 | 服务端面板端口 | 8080 |
 | 服务端隧道端口 | 8443 |
+| 重组缓冲 | 64 MB |
+| TCP Buffer | 2 MB |
+| 写超时 | 5s |
+| 帧协议版本 | ProtocolVersion=3 |
 
 ## License
 

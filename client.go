@@ -3,17 +3,20 @@
 package main
 
 import (
+	"bufio"
+	"bytes"
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"io"
 	"log"
 	"net"
-	"flag"
 	"net/http"
 	"os"
 	"runtime"
+	"runtime/debug"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -24,32 +27,54 @@ import (
 )
 
 const (
-	NumStreams         = 6
-	MSS                = 1350
-	HeaderSize         = 30
-	Magic              = 0x41455448
-	AuthTokenSize      = 32
-	PingFlag           = 0x0001
-	AuthFlag           = 0x0002
-	PongFlag           = 0x0004
-	AdaptiveFECFlag    = 0x0008
-	AetherALPN         = "h2"
-	DialTimeout        = 15 * time.Second
-	HandshakeTimeout   = 15 * time.Second
-	MaxConcurrentConns = 2000
-	SafeMTUPayload     = 1350
-	BlockAlignment     = 64
+	NumStreams           = 6
+	MSS                  = 1350
+	HeaderSize           = 30
+	Magic                = 0x41455448
+	AuthTokenSize        = 32
+	PingFlag             = 0x0001
+	AuthFlag             = 0x0002
+	PongFlag             = 0x0004
+	AdaptiveFECFlag      = 0x0008
+	ControlFrameFlag     = 0x0010
+	FastLaneFlag         = 0x0020
+	ProtocolVersion      = 3
+	AetherALPN           = "http/1.1"
+	DialTimeout          = 15 * time.Second
+	HandshakeTimeout     = 15 * time.Second
+	MaxConcurrentConns   = 2000
+	ReconnectBaseDelay   = 2 * time.Second
+	ReconnectMaxDelay    = 30 * time.Second
+	ReconnectStagger     = 500 * time.Millisecond
+	SafeMTUPayload       = 1350
+	TCPBufferSize        = 2 << 20
+	MaxReorderWindow     = 8192
+	MaxReassemblerBuf    = 64 << 20
+	ReassemblerOutputCap = 2048
+	SmallPacketFastLen   = 1200
+	ReassemblerGapTTL    = 6 * time.Second
+	TunnelWriteTimeout   = 5 * time.Second
+	LocalWriteTimeout    = 5 * time.Second
+	ProxyIdleTimeout     = 3 * time.Minute
+	LocalReadBufferSize  = 5*MSS - 7
+	DebugLogging         = false
 )
 
 var (
-	VLESSListenAddr = "0.0.0.0:11080"
-	ClientCfgFile   = "aether_client.json"
-	shardPool  = sync.Pool{New: func() interface{} { b := make([]byte, HeaderSize+MSS+1024); return &b }}
-	framePool  = sync.Pool{New: func() interface{} { return make([]byte, 16384) }}
-	outputPool = sync.Pool{New: func() interface{} { return make([]byte, 16*MSS+1024) }}
-	randSeed   = uint32(time.Now().UnixNano())
-	fecPool    sync.Map
+	LocalProxyListenAddr = "0.0.0.0:11080"
+	ClientCfgFile        = "aether_client.json"
+	shardPool            = sync.Pool{New: func() interface{} { b := make([]byte, HeaderSize+MSS+1024); return &b }}
+	framePool            = sync.Pool{New: func() interface{} { return make([]byte, 16384) }}
+	outputPool           = sync.Pool{New: func() interface{} { return make([]byte, 6*MSS+1024) }}
+	randSeed             = uint32(time.Now().UnixNano())
+	fecPool              sync.Map
 )
+
+func debugf(format string, args ...interface{}) {
+	if DebugLogging {
+		log.Printf(format, args...)
+	}
+}
 
 func getEncoder(ds, ps int) reedsolomon.Encoder {
 	if ds <= 0 {
@@ -79,15 +104,30 @@ func fastRand() uint32 {
 }
 
 func generateSmartPadding(payloadSize int) uint16 {
-	targetSize := ((payloadSize / BlockAlignment) + 1) * BlockAlignment
-	if targetSize > SafeMTUPayload {
-		padding := SafeMTUPayload - payloadSize
-		if padding < 0 {
-			return 0
-		}
-		return uint16(padding)
+	if payloadSize >= SafeMTUPayload {
+		return 0
 	}
-	return uint16(targetSize - payloadSize)
+	remaining := SafeMTUPayload - payloadSize
+	maxPad := 48
+	switch {
+	case payloadSize <= HeaderSize:
+		maxPad = 64
+	case payloadSize <= HeaderSize+AuthTokenSize:
+		maxPad = 96
+	case payloadSize < 256:
+		maxPad = 128
+	}
+	if maxPad > remaining {
+		maxPad = remaining
+	}
+	if maxPad <= 0 {
+		return 0
+	}
+	minPad := 0
+	if payloadSize <= HeaderSize+AuthTokenSize && maxPad >= 8 {
+		minPad = 8
+	}
+	return uint16(minPad + int(fastRand()%uint32(maxPad-minPad+1)))
 }
 
 func GetShardPtr() *[]byte {
@@ -118,6 +158,9 @@ func NewTokenBucket(rate, capacity float64) *TokenBucket {
 }
 
 func (tb *TokenBucket) Wait(cost float64) {
+	if tb == nil || tb.rate >= 1<<29 {
+		return
+	}
 	tb.mu.Lock()
 	now := time.Now()
 	if now.After(tb.lastToken) {
@@ -200,12 +243,13 @@ func (h *PacketHeader) GetFEC() (ds uint8, ps uint8) {
 	if h.Flags&AdaptiveFECFlag != 0 {
 		return uint8(h.Reserved >> 24), uint8((h.Reserved >> 16) & 0xFF)
 	}
-	return 4, 1
+	return 5, 1
 }
 
 func (h *PacketHeader) SetFEC(ds uint8, ps uint8) {
 	h.Flags |= AdaptiveFECFlag
 	h.Reserved = (uint32(ds) << 24) | (uint32(ps) << 16) | (h.Reserved & 0xFFFF)
+	h.Reserved = (h.Reserved & 0xFFFFFF00) | ProtocolVersion
 }
 
 type parsedFrame struct {
@@ -269,8 +313,11 @@ type TCPReassembler struct {
 	stopCh          chan struct{}
 	decodedTTL      time.Duration
 	closeOnce       sync.Once
+	wcOnce          sync.Once
+	initialized     bool
 	nextExpectedSeq uint32
 	readyBuffer     map[uint32][]byte
+	bufferedBytes   int
 	lastAdvance     time.Time
 }
 
@@ -278,23 +325,42 @@ func NewTCPReassembler(cid uint32, ttl time.Duration) *TCPReassembler {
 	ar := &TCPReassembler{
 		windows:     make(map[uint32]*TCPReassemblerEntry),
 		decoded:     make(map[uint32]*decodedRecord),
-		outputCh:    make(chan []byte, 16384), // 进一步扩大缓冲抗高并发毛刺
+		outputCh:    make(chan []byte, ReassemblerOutputCap),
 		clientID:    cid,
 		stopCh:      make(chan struct{}),
 		decodedTTL:  ttl,
 		readyBuffer: make(map[uint32][]byte),
 		lastAdvance: time.Now(),
 	}
-	ar.cleanupTicker = time.NewTicker(ttl / 2)
+	cleanupInterval := ttl / 4
+	if cleanupInterval > 2*time.Second {
+		cleanupInterval = 2 * time.Second
+	}
+	if cleanupInterval < time.Second {
+		cleanupInterval = time.Second
+	}
+	ar.cleanupTicker = time.NewTicker(cleanupInterval)
 	go ar.cleanupLoop()
 	return ar
 }
 
 func (ar *TCPReassembler) AddShard(seqNo uint32, shardIdx uint16, chunkSize uint32, dataPtr *[]byte, ds, ps uint8) {
 	ar.mu.Lock()
+	if !ar.initialized {
+		ar.nextExpectedSeq = seqNo
+		ar.initialized = true
+		ar.lastAdvance = time.Now()
+	}
 	if int32(seqNo-ar.nextExpectedSeq) < 0 || ar.decoded[seqNo] != nil {
 		ar.mu.Unlock()
 		PutShardPtr(dataPtr)
+		return
+	}
+	if seqNo-ar.nextExpectedSeq > MaxReorderWindow || ar.bufferedBytes > MaxReassemblerBuf {
+		ar.mu.Unlock()
+		PutShardPtr(dataPtr)
+		log.Printf("[WARN] reassembler overflow: seq=%d expected=%d buffered=%d, rebooting", seqNo, ar.nextExpectedSeq, ar.bufferedBytes)
+		ar.Close()
 		return
 	}
 	if ds == 0 {
@@ -325,38 +391,45 @@ func (ar *TCPReassembler) AddShard(seqNo uint32, shardIdx uint16, chunkSize uint
 		for k, v := range e.shards {
 			shardsClone[k] = v
 		}
-		delete(ar.windows, seqNo)
 	}
 	ar.mu.Unlock()
 	if triggerDecode {
 		if res := ar.decodeOutsideLock(chunkSize, shardsClone, e.ds, e.ps); res != nil {
-			ar.commitDecodedAndSend(seqNo, res)
-		} else {
 			ar.mu.Lock()
-			ar.decoded[seqNo] = &decodedRecord{decodedAt: time.Now()}
-			ar.readyBuffer[seqNo] = nil
-			ar.drainReady()
+			if cur := ar.windows[seqNo]; cur == e {
+				delete(ar.windows, seqNo)
+				for _, sp := range e.shards {
+					if sp != nil {
+						PutShardPtr(sp)
+					}
+				}
+			}
 			ar.mu.Unlock()
+			ar.commitDecodedAndSend(seqNo, res)
 		}
 	}
 }
 
 func (ar *TCPReassembler) commitDecodedAndSend(seqNo uint32, data []byte) {
 	ar.mu.Lock()
+	if old := ar.readyBuffer[seqNo]; old != nil {
+		ar.bufferedBytes -= len(old)
+		outputPool.Put(old[:cap(old)])
+	}
 	ar.decoded[seqNo] = &decodedRecord{decodedAt: time.Now()}
 	ar.readyBuffer[seqNo] = data
+	ar.bufferedBytes += len(data)
+	if ar.bufferedBytes > MaxReassemblerBuf {
+		ar.mu.Unlock()
+		log.Printf("[WARN] reassembler buffered payload exceeded %d bytes, rebooting", MaxReassemblerBuf)
+		ar.Close()
+		return
+	}
 	ar.drainReady()
 	ar.mu.Unlock()
 }
 
 func (ar *TCPReassembler) decodeOutsideLock(chunkSize uint32, shardsClone map[uint16]*[]byte, ds, ps uint8) []byte {
-	defer func() {
-		for _, sp := range shardsClone {
-			if sp != nil {
-				PutShardPtr(sp)
-			}
-		}
-	}()
 	if chunkSize == 0 || uint64(chunkSize) > uint64(int(ds)*MSS) {
 		return nil
 	}
@@ -400,19 +473,27 @@ func (ar *TCPReassembler) drainReady() {
 			case <-ar.stopCh:
 				return
 			default:
-				log.Printf("[WARN] outputCh full, dropping seq %d", ar.nextExpectedSeq)
+				log.Printf("[WARN] reassembler output queue full: expected=%d buffered=%d, restarting engine", ar.nextExpectedSeq, ar.bufferedBytes)
+				ar.Close()
+				return
 			}
 		} else {
-			log.Printf("[FEC] skip nil seq %d (decode failed)", ar.nextExpectedSeq)
+			log.Printf("[WARN] FEC seq %d 暂不可恢复，等待后续 parity 或重传窗口", ar.nextExpectedSeq)
+			break
 		}
 
 		delete(ar.readyBuffer, ar.nextExpectedSeq)
+		ar.bufferedBytes -= len(payload)
 		ar.nextExpectedSeq++
 		ar.lastAdvance = time.Now()
 	}
 
 	for s := range ar.readyBuffer {
 		if int32(s-ar.nextExpectedSeq) < 0 {
+			if payload := ar.readyBuffer[s]; payload != nil {
+				ar.bufferedBytes -= len(payload)
+				outputPool.Put(payload[:cap(payload)])
+			}
 			delete(ar.readyBuffer, s)
 		}
 	}
@@ -436,14 +517,14 @@ func (ar *TCPReassembler) cleanupLoop() {
 func (ar *TCPReassembler) cleanupStale() {
 	ar.mu.Lock()
 	n := time.Now()
-	// 核心修复 2：与服务端同步，断流 3 秒立刻强制重启引擎，实现无缝丝滑自愈
-	if len(ar.readyBuffer) > 0 && n.Sub(ar.lastAdvance) > 3*time.Second {
+	if len(ar.readyBuffer) > 0 && n.Sub(ar.lastAdvance) > ReassemblerGapTTL {
+		log.Printf("[WARN] reassembler gap timeout: expected=%d ready=%d buffered=%d", ar.nextExpectedSeq, len(ar.readyBuffer), ar.bufferedBytes)
 		ar.mu.Unlock()
 		ar.Close()
 		return
 	}
 	for k, r := range ar.decoded {
-		if n.Sub(r.decodedAt) > ar.decodedTTL && int32(k-ar.nextExpectedSeq) < 0 {
+		if int32(k-ar.nextExpectedSeq) < 0 || n.Sub(r.decodedAt) > ar.decodedTTL {
 			delete(ar.decoded, k)
 		}
 	}
@@ -464,7 +545,6 @@ func (ar *TCPReassembler) Close() {
 	ar.closeOnce.Do(func() {
 		ar.cleanupTicker.Stop()
 		close(ar.stopCh)
-		close(ar.outputCh)
 	})
 }
 
@@ -484,7 +564,7 @@ func (s *SafeStream) Write(b []byte) (int, error) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.conn.SetWriteDeadline(time.Now().Add(3 * time.Second))
+	s.conn.SetWriteDeadline(time.Now().Add(TunnelWriteTimeout))
 	defer s.conn.SetWriteDeadline(time.Time{})
 	n, err := s.conn.Write(b)
 	if err != nil {
@@ -524,11 +604,67 @@ type ProxyConn struct {
 	connID       uint32
 	conn         net.Conn
 	cl           atomic.Bool
+	lastActive   atomic.Int64
 	connectAckCh chan struct{}
 	connectErrCh chan struct{}
 	wc           chan []byte
 	done         chan struct{}
 	closeOnce    sync.Once
+	wcOnce       sync.Once
+	udpAssoc     bool
+	udpMu        sync.RWMutex
+	udpAddr      *net.UDPAddr
+}
+
+func (pc *ProxyConn) touch() {
+	pc.lastActive.Store(time.Now().UnixNano())
+}
+
+func (pc *ProxyConn) idleFor(now time.Time) time.Duration {
+	last := pc.lastActive.Load()
+	if last == 0 {
+		return 0
+	}
+	return now.Sub(time.Unix(0, last))
+}
+
+func (pc *ProxyConn) closeWriteQueue() {
+	pc.wcOnce.Do(func() {
+		if pc.wc != nil {
+			close(pc.wc)
+		}
+	})
+}
+
+func (pc *ProxyConn) closeLocal() {
+	pc.cl.Store(true)
+	pc.closeOnce.Do(func() { close(pc.done) })
+	pc.conn.Close()
+}
+func (pc *ProxyConn) setUDPAddr(addr *net.UDPAddr) {
+	if addr == nil {
+		return
+	}
+	cp := *addr
+	if addr.IP != nil {
+		cp.IP = append(net.IP(nil), addr.IP...)
+	}
+	pc.udpMu.Lock()
+	pc.udpAddr = &cp
+	pc.udpMu.Unlock()
+}
+
+func (pc *ProxyConn) getUDPAddr() *net.UDPAddr {
+	pc.udpMu.RLock()
+	defer pc.udpMu.RUnlock()
+	if pc.udpAddr == nil {
+		return nil
+	}
+	cp := *pc.udpAddr
+	if pc.udpAddr.IP != nil {
+		cp.IP = append(net.IP(nil), pc.udpAddr.IP...)
+	}
+	return &cp
 }
 
 type AdaptiveDispatcher struct {
@@ -537,8 +673,11 @@ type AdaptiveDispatcher struct {
 	streams    []*SafeStream
 	sMu        sync.RWMutex
 	tr         *TCPReassembler
+	cr         *TCPReassembler
 	pfb        []byte
+	cfb        []byte
 	fw         atomic.Uint32
+	cfw        atomic.Uint32
 	conns      sync.Map
 	stopCh     chan struct{}
 	pacing     *TokenBucket
@@ -546,6 +685,14 @@ type AdaptiveDispatcher struct {
 	currentPS  uint8
 	sdm        sync.RWMutex
 	muxWriteMu sync.Mutex
+	udpMu      sync.RWMutex
+	udpAssoc   *ProxyConn
+	udpPeers   sync.Map
+	// 重连控制
+	lastReconnect    time.Time
+	reconnectBackoff time.Duration
+	reconnectMu      sync.Mutex
+	closed           atomic.Bool
 }
 
 func NewAdaptiveDispatcher(n NodeConfig) *AdaptiveDispatcher {
@@ -555,17 +702,52 @@ func NewAdaptiveDispatcher(n NodeConfig) *AdaptiveDispatcher {
 		clientID:  cid,
 		streams:   make([]*SafeStream, NumStreams),
 		tr:        NewTCPReassembler(cid, 30*time.Second),
+		cr:        NewTCPReassembler(cid, 30*time.Second),
 		stopCh:    make(chan struct{}),
-		pacing:    NewTokenBucket(12500000, 1048576),
-		currentDS: 4,
+		pacing:    NewTokenBucket(1<<30, 64<<20), // 不在应用层限速，让底层 TCP/BBRv3 自己收敛
+		currentDS: 5,
 		currentPS: 1,
 	}
+	go ad.prewarmStreams()
 	go ad.monitorHealth()
 	go ad.handleReassembler()
+	go ad.cleanupProxyConns()
 	return ad
 }
 
+func (c *AdaptiveDispatcher) prewarmStreams() {
+	var wg sync.WaitGroup
+	for i := 0; i < NumStreams; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			select {
+			case <-c.stopCh:
+				return
+			default:
+			}
+			st := c.dialStream()
+			if st == nil {
+				return
+			}
+			c.sMu.Lock()
+			if c.streams[idx] == nil || c.streams[idx].IsClosed() {
+				c.streams[idx] = st
+				st = nil
+			}
+			c.sMu.Unlock()
+			if st != nil {
+				st.Close()
+			}
+		}(i)
+	}
+	wg.Wait()
+}
+
 func (c *AdaptiveDispatcher) reboot() {
+	if c.closed.Load() {
+		return
+	}
 	log.Printf("[CLI] 🔴 引擎长时间停滞或数据流严重损坏，执行安全热重启...")
 	c.Close()
 	go func() {
@@ -575,8 +757,12 @@ func (c *AdaptiveDispatcher) reboot() {
 }
 
 func (c *AdaptiveDispatcher) Close() {
+	if c.closed.Swap(true) {
+		return // 已经关闭，防止 double-close panic
+	}
 	select {
 	case <-c.stopCh:
+		return
 	default:
 		close(c.stopCh)
 	}
@@ -589,20 +775,46 @@ func (c *AdaptiveDispatcher) Close() {
 	}
 	c.sMu.Unlock()
 	c.tr.Close()
+	c.cr.Close()
 	c.conns.Range(func(k, v interface{}) bool {
 		pc := v.(*ProxyConn)
-		pc.cl.Store(true)
-		pc.conn.Close()
+		pc.closeLocal()
 		c.conns.Delete(k)
 		return true
 	})
 }
 
+func (c *AdaptiveDispatcher) cleanupProxyConns() {
+	tk := time.NewTicker(30 * time.Second)
+	defer tk.Stop()
+	for {
+		select {
+		case <-c.stopCh:
+			return
+		case <-tk.C:
+			now := time.Now()
+			c.conns.Range(func(k, v interface{}) bool {
+				pc := v.(*ProxyConn)
+				if pc.cl.Load() {
+					c.conns.Delete(k)
+					return true
+				}
+				if pc.idleFor(now) > ProxyIdleTimeout {
+					debugf("[CLI] closing idle proxy conn: connID=%d idle=%s", pc.connID, pc.idleFor(now).Round(time.Second))
+					pc.closeLocal()
+					c.conns.Delete(k)
+				}
+				return true
+			})
+		}
+	}
+}
+
 func TuneTCPConn(conn net.Conn) {
 	if tc, ok := conn.(*net.TCPConn); ok {
 		tc.SetNoDelay(true)
-		tc.SetReadBuffer(4 << 20)
-		tc.SetWriteBuffer(4 << 20)
+		tc.SetReadBuffer(TCPBufferSize)
+		tc.SetWriteBuffer(TCPBufferSize)
 		tc.SetKeepAlive(true)
 		tc.SetKeepAlivePeriod(15 * time.Second)
 	}
@@ -621,7 +833,7 @@ func (c *AdaptiveDispatcher) getTlsConfig() *utls.Config {
 	return &utls.Config{
 		ServerName:         sni,
 		InsecureSkipVerify: true,
-		NextProtos:         []string{AetherALPN, "h2", "http/1.1"},
+		NextProtos:         []string{AetherALPN},
 	}
 }
 
@@ -678,8 +890,13 @@ func (c *AdaptiveDispatcher) streamReadLoop(st *SafeStream) {
 			st.Close()
 			return
 		}
+		if h.Flags&AdaptiveFECFlag != 0 && byte(h.Reserved&0xFF) != ProtocolVersion {
+			log.Printf("[CLI] protocol version mismatch: got=%d want=%d", byte(h.Reserved&0xFF), ProtocolVersion)
+			st.Close()
+			return
+		}
 		ds, ps := h.GetFEC()
-		if ds > 0 && ps > 0 {
+		if ds > 0 && ps > 0 && h.Flags&(ControlFrameFlag|FastLaneFlag|PingFlag|PongFlag|AuthFlag) == 0 {
 			c.sdm.Lock()
 			c.currentDS = ds
 			c.currentPS = ps
@@ -687,7 +904,7 @@ func (c *AdaptiveDispatcher) streamReadLoop(st *SafeStream) {
 		}
 		ss := int((h.ChunkSize + uint32(ds) - 1) / uint32(ds))
 		tl := uint32(ss) + uint32(h.PaddingLen)
-		
+
 		var bp *[]byte
 		if tl > 0 {
 			bp = GetShardPtr()
@@ -697,21 +914,21 @@ func (c *AdaptiveDispatcher) streamReadLoop(st *SafeStream) {
 				return
 			}
 		}
-		
+
 		if h.Flags&PingFlag != 0 {
 			pl := generateSmartPadding(HeaderSize)
 			p := &PacketHeader{Magic: Magic, ClientID: c.clientID, Flags: PongFlag, Timestamp: h.Timestamp, PaddingLen: pl}
 			c.sdm.RLock()
 			p.SetFEC(c.currentDS, c.currentPS)
 			c.sdm.RUnlock()
-			
+
 			bo := make([]byte, HeaderSize+int(pl))
 			p.EncodeTo(bo[:HeaderSize])
-			
+
 			if _, err := st.Write(bo); err != nil {
 				st.Close()
 			}
-			
+
 			if bp != nil {
 				PutShardPtr(bp)
 			}
@@ -733,13 +950,17 @@ func (c *AdaptiveDispatcher) streamReadLoop(st *SafeStream) {
 		}
 		if bp != nil {
 			*bp = (*bp)[:HeaderSize+ss]
-			c.tr.AddShard(h.SeqNo, h.ShardIdx, h.ChunkSize, bp, ds, ps)
+			if h.Flags&ControlFrameFlag != 0 {
+				c.cr.AddShard(h.SeqNo, h.ShardIdx, h.ChunkSize, bp, ds, ps)
+			} else {
+				c.tr.AddShard(h.SeqNo, h.ShardIdx, h.ChunkSize, bp, ds, ps)
+			}
 		}
 	}
 }
 
 func (c *AdaptiveDispatcher) monitorHealth() {
-	tk := time.NewTicker(2 * time.Second)
+	tk := time.NewTicker(5 * time.Second)
 	defer tk.Stop()
 	for {
 		select {
@@ -778,22 +999,22 @@ func (c *AdaptiveDispatcher) monitorHealth() {
 						c.sdm.RLock()
 						h.SetFEC(c.currentDS, c.currentPS)
 						c.sdm.RUnlock()
-						
+
 						b := make([]byte, HeaderSize+int(pl))
 						h.EncodeTo(b[:HeaderSize])
-						
+
 						if _, err := st.Write(b); err != nil {
 							st.Close()
 						}
 
-						tc := time.NewTimer(2 * time.Second)
+						tc := time.NewTimer(6 * time.Second)
 						select {
 						case <-st.pingCh:
 							tc.Stop()
 							st.lossCount.Store(0)
 						case <-tc.C:
 							st.lossCount.Add(1)
-							if st.lossCount.Load() > 1 {
+							if st.lossCount.Load() > 3 {
 								st.Close()
 							}
 						}
@@ -804,18 +1025,108 @@ func (c *AdaptiveDispatcher) monitorHealth() {
 
 			if activeCount > 0 {
 				avgRTT /= int64(activeCount)
+				// 有存活流，重置退避
+				c.reconnectMu.Lock()
+				c.reconnectBackoff = 0
+				c.reconnectMu.Unlock()
+			} else {
+				// 全部流死亡，触发退避重连
+				c.reconnectMu.Lock()
+				if c.reconnectBackoff == 0 {
+					c.reconnectBackoff = ReconnectBaseDelay
+				} else {
+					c.reconnectBackoff *= 2
+					if c.reconnectBackoff > ReconnectMaxDelay {
+						c.reconnectBackoff = ReconnectMaxDelay
+					}
+				}
+				delay := c.reconnectBackoff
+				c.reconnectMu.Unlock()
+
+				log.Printf("[CLI] ⚠️ 全部 %d 条流断开，%v 后开始逐条重连...", NumStreams, delay)
+				time.Sleep(delay)
+
+				// 逐条重连，间隔 500ms，避免同时拨号冲击服务端
+				for i := 0; i < NumStreams; i++ {
+					select {
+					case <-c.stopCh:
+						return
+					default:
+					}
+					c.sMu.RLock()
+					st := c.streams[i]
+					c.sMu.RUnlock()
+					if st != nil && !st.IsClosed() {
+						continue
+					}
+					newSt := c.dialStream()
+					if newSt != nil {
+						c.sMu.Lock()
+						c.streams[i] = newSt
+						c.sMu.Unlock()
+						log.Printf("[CLI] ✅ 流 %d 重连成功", i)
+					} else {
+						log.Printf("[CLI] ❌ 流 %d 重连失败，将在下次周期重试", i)
+					}
+					time.Sleep(ReconnectStagger)
+				}
+				continue
 			}
+
 			lossRate := float64(lossCount) / float64(NumStreams)
 			c.sdm.Lock()
-			if lossRate > 0.15 {
+			switch {
+			case activeCount >= 6 && lossRate < 0.08:
+				c.currentDS, c.currentPS = 5, 1
+			case activeCount >= 5 && lossRate > 0.18:
 				c.currentDS, c.currentPS = 4, 2
-			} else if avgRTT > 0 && avgRTT < 100 && lossRate < 0.02 {
-				c.currentDS, c.currentPS = 10, 1
-			} else {
+			case activeCount >= 5:
 				c.currentDS, c.currentPS = 4, 1
+			case activeCount >= 4:
+				c.currentDS, c.currentPS = 3, 1
+			default:
+				c.currentDS, c.currentPS = 2, 1
 			}
 			c.sdm.Unlock()
 		}
+	}
+}
+
+func (c *AdaptiveDispatcher) sendFinFrame(connID uint32) {
+	fb := framePool.Get().([]byte)
+	fb = fb[:7]
+	fb[0] = 0x06
+	binary.BigEndian.PutUint32(fb[1:5], connID)
+	binary.BigEndian.PutUint16(fb[5:7], 0)
+	c.SendChunk(fb)
+	framePool.Put(fb[:cap(fb)])
+}
+
+func (c *AdaptiveDispatcher) sendCloseFrame(connID uint32) {
+	fb := framePool.Get().([]byte)
+	fb = fb[:7]
+	fb[0] = 0x03
+	binary.BigEndian.PutUint32(fb[1:5], connID)
+	binary.BigEndian.PutUint16(fb[5:7], 0)
+	c.SendChunk(fb)
+	framePool.Put(fb[:cap(fb)])
+}
+
+func (c *AdaptiveDispatcher) writeSOCKS5UDP(pc *ProxyConn, payload []byte) {
+	addr := pc.getUDPAddr()
+	if addr == nil {
+		return
+	}
+	uc := localProxyUDP
+	if uc == nil {
+		return
+	}
+	pkt := buildSOCKS5UDPDatagram(payload)
+	uc.SetWriteDeadline(time.Now().Add(LocalWriteTimeout))
+	_, err := uc.WriteToUDP(pkt, addr)
+	uc.SetWriteDeadline(time.Time{})
+	if err != nil {
+		debugf("[CLI] socks udp write failed connID=%d addr=%s err=%v", pc.connID, addr, err)
 	}
 }
 
@@ -827,47 +1138,77 @@ func (c *AdaptiveDispatcher) handleReassembler() {
 		case <-c.tr.stopCh:
 			c.reboot()
 			return
-		case d, ok := <-c.tr.Output():
-			if !ok {
+		case <-c.cr.stopCh:
+			c.reboot()
+			return
+		case d := <-c.tr.Output():
+			if !c.handleReassembledPayload(&c.pfb, d) {
 				return
 			}
-			frames, ok := parseFrames(&c.pfb, d)
-			if !ok {
-				outputPool.Put(d[:cap(d)])
-				c.reboot()
+		case d := <-c.cr.Output():
+			if !c.handleReassembledPayload(&c.cfb, d) {
 				return
 			}
-			for _, f := range frames {
-				if pc, ok := c.conns.Load(f.ConnID); ok {
-					pc2 := pc.(*ProxyConn)
-					if f.Type == 1 {
-						select {
-						case pc2.connectAckCh <- struct{}{}:
-						default:
-						}
-					} else if f.Type == 4 || f.Type == 5 {
-						if !pc2.cl.Load() {
-							select {
-							case pc2.wc <- f.Payload:
-							default:
-								pc2.cl.Store(true)
-								pc2.conn.Close()
-							}
-						}
-					} else if f.Type == 2 || f.Type == 3 {
-						select {
-						case pc2.connectErrCh <- struct{}{}:
-						default:
-						}
-						pc2.cl.Store(true)
-						pc2.conn.Close()
+		}
+	}
+}
+
+func (c *AdaptiveDispatcher) handleReassembledPayload(pfb *[]byte, d []byte) bool {
+	frames, ok := parseFrames(pfb, d)
+	if !ok {
+		outputPool.Put(d[:cap(d)])
+		c.reboot()
+		return false
+	}
+	for _, f := range frames {
+		if pc, ok := c.conns.Load(f.ConnID); ok {
+			pc2 := pc.(*ProxyConn)
+			pc2.touch()
+			switch f.Type {
+			case 1:
+				select {
+				case pc2.connectAckCh <- struct{}{}:
+				default:
+				}
+			case 2:
+				select {
+				case pc2.connectErrCh <- struct{}{}:
+				default:
+				}
+				pc2.closeLocal()
+				c.conns.Delete(f.ConnID)
+			case 3:
+				if pc2.udpAssoc {
+					pc2.closeLocal()
+				} else {
+					pc2.closeWriteQueue()
+				}
+				c.conns.Delete(f.ConnID)
+			case 4:
+				if !pc2.cl.Load() {
+					select {
+					case pc2.wc <- f.Payload:
+					default:
+						log.Printf("[FATAL] local TCP write queue blocked (connID=%d), closing target", f.ConnID)
+						pc2.closeLocal()
+						c.sendCloseFrame(f.ConnID)
 						c.conns.Delete(f.ConnID)
 					}
 				}
+			case 5:
+				if pc2.udpAssoc && !pc2.cl.Load() {
+					c.writeSOCKS5UDP(pc2, f.Payload)
+				}
+			case 6:
+				if !pc2.udpAssoc {
+					pc2.closeWriteQueue()
+					c.conns.Delete(f.ConnID)
+				}
 			}
-			outputPool.Put(d[:cap(d)])
 		}
 	}
+	outputPool.Put(d[:cap(d)])
+	return true
 }
 
 type streamStat struct {
@@ -875,11 +1216,49 @@ type streamStat struct {
 	rtt int64
 }
 
-func (c *AdaptiveDispatcher) SendChunk(data []byte) {
-	if len(data) == 0 {
-		return
+func (c *AdaptiveDispatcher) SendChunk(data []byte) bool {
+	return c.sendChunk(data, isClientControlFrame(data))
+}
+
+func isClientControlFrame(data []byte) bool {
+	if len(data) < 7 {
+		return false
 	}
-	
+	if len(data) != 7+int(binary.BigEndian.Uint16(data[5:7])) {
+		return false
+	}
+	return data[0] == 0x01 || data[0] == 0x03
+}
+
+func chooseClientDataFEC(active, curDS, curPS, remaining int) (int, int) {
+	if remaining <= SmallPacketFastLen {
+		return 1, 2
+	}
+	switch {
+	case active >= 6:
+		if curDS <= 1 || curPS <= 0 {
+			return 5, 1
+		}
+		return curDS, curPS
+	case active == 5:
+		return 4, 2
+	case active == 4:
+		return 3, 2
+	case active == 3:
+		return 2, 2
+	default:
+		return 1, 2
+	}
+}
+
+func (c *AdaptiveDispatcher) sendChunk(data []byte, control bool) bool {
+	if len(data) == 0 {
+		return true
+	}
+	if c.closed.Load() {
+		return false
+	}
+
 	c.pacing.Wait(float64(len(data)))
 
 	c.muxWriteMu.Lock()
@@ -888,6 +1267,9 @@ func (c *AdaptiveDispatcher) SendChunk(data []byte) {
 	o := 0
 	var noStreamSince time.Time
 	for o < len(data) {
+		if c.closed.Load() {
+			return false
+		}
 		c.sMu.RLock()
 		var stats []streamStat
 		for _, st := range c.streams {
@@ -902,11 +1284,11 @@ func (c *AdaptiveDispatcher) SendChunk(data []byte) {
 			}
 			if time.Since(noStreamSince) > 10*time.Second {
 				log.Printf("[CLI] no active tunnel streams; dropping %d bytes after wait", len(data)-o)
-				return
+				return false
 			}
 			select {
 			case <-c.stopCh:
-				return
+				return false
 			case <-time.After(20 * time.Millisecond):
 			}
 			continue
@@ -914,15 +1296,25 @@ func (c *AdaptiveDispatcher) SendChunk(data []byte) {
 		noStreamSince = time.Time{}
 		sort.Slice(stats, func(i, j int) bool { return stats[i].rtt < stats[j].rtt })
 
-		c.sdm.RLock()
-		ds, ps := int(c.currentDS), int(c.currentPS)
-		c.sdm.RUnlock()
+		var ds, ps int
+		var sq uint32
+		var fastLane bool
+		if control {
+			ds, ps = 1, 2
+			sq = c.cfw.Add(1) - 1
+		} else {
+			c.sdm.RLock()
+			ds, ps = int(c.currentDS), int(c.currentPS)
+			c.sdm.RUnlock()
+			ds, ps = chooseClientDataFEC(len(stats), ds, ps, len(data)-o)
+			sq = c.fw.Add(1) - 1
+			fastLane = ds == 1 && ps >= 2
+		}
 
 		enc := getEncoder(ds, ps)
 		if enc == nil {
-			return
+			return false
 		}
-		sq := c.fw.Add(1) - 1
 		total := ds + ps
 		e := o + ds*MSS
 		if e > len(data) {
@@ -934,16 +1326,16 @@ func (c *AdaptiveDispatcher) SendChunk(data []byte) {
 		if ss > MSS {
 			ss = MSS
 		}
-		
+
 		sh := make([][]byte, total)
 		buffers := make([][]byte, total)
-		
+
 		for i := 0; i < total; i++ {
 			maxPktLen := HeaderSize + ss + SafeMTUPayload
 			buf := make([]byte, maxPktLen)
 			buffers[i] = buf
 			sh[i] = buf[HeaderSize : HeaderSize+ss]
-			
+
 			if i < ds {
 				st, en := i*ss, i*ss+ss
 				if st < int(cs) {
@@ -956,36 +1348,377 @@ func (c *AdaptiveDispatcher) SendChunk(data []byte) {
 		}
 
 		if err := enc.Encode(sh); err != nil {
-			return
+			return false
 		}
-		
+
 		ts := uint32(time.Now().UnixMilli() & 0xFFFFFFFF)
+		success := 0
 		for i := 0; i < total; i++ {
 			st := stats[i%len(stats)].st
 			actualChunkSize := HeaderSize + len(sh[i])
 			pl := generateSmartPadding(actualChunkSize)
-			
+
 			h := &PacketHeader{Magic: Magic, ClientID: c.clientID, SeqNo: sq, ShardIdx: uint16(i), PaddingLen: pl, ChunkSize: cs, Timestamp: ts}
+			if control {
+				h.Flags |= ControlFrameFlag
+			} else if fastLane {
+				h.Flags |= FastLaneFlag
+			}
 			h.SetFEC(uint8(ds), uint8(ps))
-			
+
 			buf := buffers[i]
 			h.EncodeTo(buf[:HeaderSize])
-			
+
 			pe := HeaderSize + len(sh[i])
 			for j := pe; j < pe+int(pl); j++ {
 				buf[j] = 0
 			}
-			
+
 			pkt := buf[:pe+int(pl)]
 			if _, err := st.Write(pkt); err != nil {
 				st.Close()
+			} else {
+				success++
 			}
+		}
+		if success < ds {
+			log.Printf("[CLI] tunnel shard write quorum failed: seq=%d success=%d required=%d", sq, success, ds)
+			return false
 		}
 		o = e
 	}
+	return true
 }
 
 func (c *AdaptiveDispatcher) DialProxy(conn net.Conn) {
+	conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+	var first [1]byte
+	if _, err := io.ReadFull(conn, first[:]); err != nil {
+		conn.Close()
+		return
+	}
+
+	switch first[0] {
+	case 0x05:
+		c.handleSOCKS5(conn)
+	case 'C', 'G', 'P', 'H', 'O', 'D', 'T':
+		c.handleHTTPProxy(conn, first[0])
+	default:
+		log.Printf("[CLI] unsupported local proxy protocol: first=0x%02x; use SOCKS5 or HTTP CONNECT", first[0])
+		conn.Close()
+	}
+}
+
+func (c *AdaptiveDispatcher) handleSOCKS5(conn net.Conn) {
+	var nMethods [1]byte
+	if _, err := io.ReadFull(conn, nMethods[:]); err != nil {
+		conn.Close()
+		return
+	}
+	methods := make([]byte, int(nMethods[0]))
+	if _, err := io.ReadFull(conn, methods); err != nil {
+		conn.Close()
+		return
+	}
+	if _, err := conn.Write([]byte{0x05, 0x00}); err != nil {
+		conn.Close()
+		return
+	}
+
+	var hdr [4]byte
+	if _, err := io.ReadFull(conn, hdr[:]); err != nil {
+		conn.Close()
+		return
+	}
+	if hdr[0] != 0x05 {
+		conn.Close()
+		return
+	}
+
+	cmd := hdr[1]
+	addr, targetPort, err := readSOCKS5Addr(conn, hdr[3])
+	if err != nil {
+		conn.Write(socks5Reply(0x08, nil, 0))
+		conn.Close()
+		return
+	}
+	conn.SetReadDeadline(time.Time{})
+
+	switch cmd {
+	case 0x01:
+		c.DialProxyTarget(conn, addr, targetPort, func() bool {
+			_, err := conn.Write(socks5Reply(0x00, nil, 0))
+			return err == nil
+		})
+	case 0x03:
+		c.handleSOCKS5UDPAssociate(conn)
+	default:
+		conn.Write(socks5Reply(0x07, nil, 0))
+		conn.Close()
+	}
+}
+
+func readSOCKS5Addr(r io.Reader, atyp byte) (string, uint16, error) {
+	var addr string
+	switch atyp {
+	case 0x01:
+		b := make([]byte, 4)
+		if _, err := io.ReadFull(r, b); err != nil {
+			return "", 0, err
+		}
+		addr = net.IP(b).String()
+	case 0x03:
+		var lb [1]byte
+		if _, err := io.ReadFull(r, lb[:]); err != nil {
+			return "", 0, err
+		}
+		if lb[0] == 0 {
+			return "", 0, fmt.Errorf("empty socks domain")
+		}
+		b := make([]byte, int(lb[0]))
+		if _, err := io.ReadFull(r, b); err != nil {
+			return "", 0, err
+		}
+		addr = string(b)
+	case 0x04:
+		b := make([]byte, 16)
+		if _, err := io.ReadFull(r, b); err != nil {
+			return "", 0, err
+		}
+		addr = net.IP(b).String()
+	default:
+		return "", 0, fmt.Errorf("unsupported socks atyp 0x%02x", atyp)
+	}
+	var pb [2]byte
+	if _, err := io.ReadFull(r, pb[:]); err != nil {
+		return "", 0, err
+	}
+	return addr, binary.BigEndian.Uint16(pb[:]), nil
+}
+
+func socks5Reply(rep byte, ip net.IP, port int) []byte {
+	if port < 0 || port > 65535 {
+		port = 0
+	}
+	if ip4 := ip.To4(); ip4 != nil {
+		b := make([]byte, 10)
+		b[0], b[1], b[2], b[3] = 0x05, rep, 0x00, 0x01
+		copy(b[4:8], ip4)
+		binary.BigEndian.PutUint16(b[8:10], uint16(port))
+		return b
+	}
+	if ip16 := ip.To16(); ip16 != nil {
+		b := make([]byte, 22)
+		b[0], b[1], b[2], b[3] = 0x05, rep, 0x00, 0x04
+		copy(b[4:20], ip16)
+		binary.BigEndian.PutUint16(b[20:22], uint16(port))
+		return b
+	}
+	b := make([]byte, 10)
+	b[0], b[1], b[2], b[3] = 0x05, rep, 0x00, 0x01
+	binary.BigEndian.PutUint16(b[8:10], uint16(port))
+	return b
+}
+
+func localProxyBindIP(conn net.Conn) net.IP {
+	if ta, ok := conn.LocalAddr().(*net.TCPAddr); ok && ta.IP != nil && !ta.IP.IsUnspecified() {
+		return ta.IP
+	}
+	return net.IPv4(0, 0, 0, 0)
+}
+
+func localProxyUDPPort() int {
+	uc := localProxyUDP
+	if uc == nil {
+		return 0
+	}
+	if ua, ok := uc.LocalAddr().(*net.UDPAddr); ok {
+		return ua.Port
+	}
+	return 0
+}
+
+func parseSOCKS5UDPDatagram(d []byte) ([]byte, bool) {
+	if len(d) < 4 || d[0] != 0 || d[1] != 0 || d[2] != 0 {
+		return nil, false
+	}
+	p := d[3:]
+	if len(p) > 65535 {
+		return nil, false
+	}
+	switch p[0] {
+	case 0x01:
+		if len(p) < 7 {
+			return nil, false
+		}
+	case 0x03:
+		if len(p) < 2 {
+			return nil, false
+		}
+		dl := int(p[1])
+		if len(p) < 4+dl {
+			return nil, false
+		}
+	case 0x04:
+		if len(p) < 19 {
+			return nil, false
+		}
+	default:
+		return nil, false
+	}
+	out := make([]byte, len(p))
+	copy(out, p)
+	return out, true
+}
+
+func buildSOCKS5UDPDatagram(payload []byte) []byte {
+	pkt := make([]byte, 3+len(payload))
+	copy(pkt[3:], payload)
+	return pkt
+}
+
+func (c *AdaptiveDispatcher) resolveUDPAssociation(addr *net.UDPAddr) *ProxyConn {
+	if addr == nil {
+		return nil
+	}
+	key := addr.String()
+	if v, ok := c.udpPeers.Load(key); ok {
+		pc := v.(*ProxyConn)
+		if !pc.cl.Load() {
+			pc.setUDPAddr(addr)
+			return pc
+		}
+		c.udpPeers.Delete(key)
+	}
+	c.udpMu.RLock()
+	pc := c.udpAssoc
+	c.udpMu.RUnlock()
+	if pc == nil || pc.cl.Load() {
+		return nil
+	}
+	pc.setUDPAddr(addr)
+	c.udpPeers.Store(key, pc)
+	return pc
+}
+
+func (c *AdaptiveDispatcher) clearUDPAssociation(pc *ProxyConn) {
+	c.udpMu.Lock()
+	if c.udpAssoc == pc {
+		c.udpAssoc = nil
+	}
+	c.udpMu.Unlock()
+	c.udpPeers.Range(func(k, v interface{}) bool {
+		if v.(*ProxyConn) == pc {
+			c.udpPeers.Delete(k)
+		}
+		return true
+	})
+}
+
+func (c *AdaptiveDispatcher) sendUDPDatagramFromLocal(addr *net.UDPAddr, payload []byte) {
+	pc := c.resolveUDPAssociation(addr)
+	if pc == nil || pc.cl.Load() || len(payload) > 65535 {
+		return
+	}
+	pc.touch()
+	fb := framePool.Get().([]byte)
+	frameLen := 7 + len(payload)
+	if cap(fb) < frameLen {
+		fb = make([]byte, frameLen)
+	}
+	fb = fb[:frameLen]
+	fb[0] = 0x05
+	binary.BigEndian.PutUint32(fb[1:5], pc.connID)
+	binary.BigEndian.PutUint16(fb[5:7], uint16(len(payload)))
+	copy(fb[7:], payload)
+	c.SendChunk(fb)
+	framePool.Put(fb[:cap(fb)])
+}
+
+func (c *AdaptiveDispatcher) handleSOCKS5UDPAssociate(conn net.Conn) {
+	pc := &ProxyConn{
+		connID:       fastRand(),
+		conn:         conn,
+		connectAckCh: make(chan struct{}, 1),
+		connectErrCh: make(chan struct{}, 1),
+		wc:           make(chan []byte, 16),
+		done:         make(chan struct{}),
+		udpAssoc:     true,
+	}
+	pc.touch()
+	c.conns.Store(pc.connID, pc)
+	c.udpMu.Lock()
+	c.udpAssoc = pc
+	c.udpMu.Unlock()
+
+	defer func() {
+		c.clearUDPAssociation(pc)
+		pc.closeLocal()
+		c.conns.Delete(pc.connID)
+		c.sendCloseFrame(pc.connID)
+	}()
+
+	port := localProxyUDPPort()
+	if port == 0 {
+		conn.Write(socks5Reply(0x01, nil, 0))
+		return
+	}
+	if _, err := conn.Write(socks5Reply(0x00, localProxyBindIP(conn), port)); err != nil {
+		return
+	}
+
+	buf := make([]byte, 1)
+	for {
+		if _, err := conn.Read(buf); err != nil {
+			return
+		}
+		pc.touch()
+	}
+}
+func (c *AdaptiveDispatcher) handleHTTPProxy(conn net.Conn, first byte) {
+	br := bufio.NewReader(io.MultiReader(bytes.NewReader([]byte{first}), conn))
+	req, err := http.ReadRequest(br)
+	if err != nil {
+		conn.Close()
+		return
+	}
+	if req.Method != http.MethodConnect {
+		io.WriteString(conn, "HTTP/1.1 405 Method Not Allowed\r\nConnection: close\r\n\r\n")
+		conn.Close()
+		return
+	}
+	host, portStr, err := net.SplitHostPort(req.Host)
+	if err != nil {
+		host = req.Host
+		portStr = "443"
+	}
+	port, err := net.LookupPort("tcp", portStr)
+	if err != nil || port <= 0 || port > 65535 {
+		io.WriteString(conn, "HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n")
+		conn.Close()
+		return
+	}
+	conn.SetReadDeadline(time.Time{})
+	bc := &bufferedProxyConn{Conn: conn, r: br}
+	c.DialProxyTarget(bc, host, uint16(port), func() bool {
+		_, err := io.WriteString(conn, "HTTP/1.1 200 Connection Established\r\n\r\n")
+		return err == nil
+	})
+}
+
+type bufferedProxyConn struct {
+	net.Conn
+	r *bufio.Reader
+}
+
+func (c *bufferedProxyConn) Read(p []byte) (int, error) {
+	if c.r != nil && c.r.Buffered() > 0 {
+		return c.r.Read(p)
+	}
+	return c.Conn.Read(p)
+}
+
+func (c *AdaptiveDispatcher) DialProxyTarget(conn net.Conn, addr string, targetPort uint16, writeOK func() bool) {
 	pc := &ProxyConn{
 		connID:       fastRand(),
 		conn:         conn,
@@ -994,165 +1727,49 @@ func (c *AdaptiveDispatcher) DialProxy(conn net.Conn) {
 		wc:           make(chan []byte, 1024),
 		done:         make(chan struct{}),
 	}
+	pc.touch()
 	c.conns.Store(pc.connID, pc)
 
 	go func() {
+		hardClose := true
 		defer func() {
-			pc.cl.Store(true)
-			pc.closeOnce.Do(func() { close(pc.done) })
-			conn.Close()
+			pc.closeLocal()
 			c.conns.Delete(pc.connID)
-
-			fb := framePool.Get().([]byte)
-			fb = fb[:7]
-			fb[0] = 0x03
-			binary.BigEndian.PutUint32(fb[1:5], pc.connID)
-			binary.BigEndian.PutUint16(fb[5:7], 0)
-			c.SendChunk(fb)
-			framePool.Put(fb[:cap(fb)])
+			if hardClose {
+				c.sendCloseFrame(pc.connID)
+			}
 		}()
 
-		conn.SetReadDeadline(time.Now().Add(10 * time.Second))
-
-		ver := make([]byte, 1)
-		if _, err := io.ReadFull(conn, ver); err != nil {
-			return
-		}
-		if ver[0] != 0 {
-			log.Printf("[CLI] 致命: 收到非 VLESS 流量 (首字节: 0x%02x)，请检查软路由是否关掉了 TLS", ver[0])
+		if addr == "" || targetPort == 0 || len(addr) > 255 {
 			return
 		}
 
-		uuid := make([]byte, 16)
-		if _, err := io.ReadFull(conn, uuid); err != nil {
-			return
-		}
-
-		addonLenBuf := make([]byte, 1)
-		if _, err := io.ReadFull(conn, addonLenBuf); err != nil {
-			return
-		}
-		addonLen := int(addonLenBuf[0])
-		if addonLen > 0 {
-			addon := make([]byte, addonLen)
-			if _, err := io.ReadFull(conn, addon); err != nil {
-				return
-			}
-		}
-
-		cmdBuf := make([]byte, 1)
-		if _, err := io.ReadFull(conn, cmdBuf); err != nil {
-			return
-		}
-		cmd := cmdBuf[0]
-		if cmd == 3 {
-			// 核心修复机制 3：封杀本地拨号陷阱，硬拦截多路复用请求
-			log.Printf("===============================================================")
-			log.Printf("[CLI] 🛑 致命错误: 拦截到了 V2Ray Mux (多路复用) 请求！")
-			log.Printf("[CLI] 🛑 原因解释: 上个版本尝试在本地解析 MUX，导致你的流量没有过墙就被本地直连发出了！")
-			log.Printf("[CLI] 🛑 解决方案: 请立即前往 PassWall -> 节点设置 -> 关闭【Mux】(多路复用) 功能！")
-			log.Printf("[CLI] 🛑 Aether 引擎底层已自带并发多路物理隧道，嵌套 Mux 会直接导致断网！")
-			log.Printf("===============================================================")
-			return
-		}
-		if cmd != 1 {
-			log.Printf("[CLI] 警告: 拦截了非 TCP 请求 (CMD=%d)", cmd)
-			return
-		}
-
-		portBuf := make([]byte, 2)
-		if _, err := io.ReadFull(conn, portBuf); err != nil {
-			return
-		}
-
-		atypBuf := make([]byte, 1)
-		if _, err := io.ReadFull(conn, atypBuf); err != nil {
-			return
-		}
-		atyp := atypBuf[0]
-
-		var addr string
-		
-		switch atyp {
-		case 0x01: // IPv4
-			ip := make([]byte, 4)
-			if _, err := io.ReadFull(conn, ip); err != nil {
-				return
-			}
-			addr = net.IP(ip).String()
-		case 0x02: // 官方规范: VLESS 域名 
-			lenBuf := make([]byte, 1)
-			if _, err := io.ReadFull(conn, lenBuf); err != nil {
-				return
-			}
-			domainLen := int(lenBuf[0])
-			domainBuf := make([]byte, domainLen)
-			if _, err := io.ReadFull(conn, domainBuf); err != nil {
-				return
-			}
-			addr = string(domainBuf)
-		case 0x03: // 变体兼容: SOCKS5 误传域名类型
-			lenBuf := make([]byte, 1)
-			if _, err := io.ReadFull(conn, lenBuf); err != nil {
-				return
-			}
-			domainLen := int(lenBuf[0])
-			domainBuf := make([]byte, domainLen)
-			if _, err := io.ReadFull(conn, domainBuf); err != nil {
-				return
-			}
-			addr = string(domainBuf)
-		case 0x04: // IPv6
-			ip := make([]byte, 16)
-			if _, err := io.ReadFull(conn, ip); err != nil {
-				return
-			}
-			addr = net.IP(ip).String()
-		default:
-			log.Printf("[CLI] 致命: 未知的 VLESS ATYP: 0x%02x", atyp)
-			return
-		}
-
-		conn.SetReadDeadline(time.Time{})
-        
-		targetPort := binary.BigEndian.Uint16(portBuf)
-
-		// 核心防护：防透明代理回环 (Routing Loop)
 		serverHost, _, err := net.SplitHostPort(c.node.Server)
 		if err != nil || serverHost == "" {
 			serverHost = c.node.Server
 		}
-		
 		isLoop := false
 		if addr == serverHost {
 			isLoop = true
-		} else {
-			if ips, err := net.LookupIP(serverHost); err == nil {
-				for _, ip := range ips {
-					if addr == ip.String() {
-						isLoop = true
-						break
-					}
+		} else if ips, err := net.LookupIP(serverHost); err == nil {
+			for _, ip := range ips {
+				if addr == ip.String() {
+					isLoop = true
+					break
 				}
 			}
 		}
-
 		if isLoop {
-			log.Printf("===============================================================")
-			log.Printf("[CLI] 🛑 致命错误: 拦截到发往代理服务器自身 (%s) 的流量！", addr)
-			log.Printf("[CLI] 🛑 原因解释: 软路由(PassWall)把 Aether 客户端的底层出站流量也给劫持了，形成了无限死循环！")
-			log.Printf("[CLI] 🛑 解决方案: 请前往 PassWall -> 规则管理 -> 直连 IP 列表，将服务器 IP [%s] 添加进去！", addr)
-			log.Printf("===============================================================")
+			log.Printf("[CLI] blocked local proxy routing loop to server itself: %s", addr)
 			return
 		}
 
-		addrLen := len(addr)
-		log.Printf("[CLI] 建立通道 -> %s:%d", addr, targetPort)
-		reqLen := 1 + addrLen + 2
+		debugf("[CLI] proxy target -> %s:%d", addr, targetPort)
+		reqLen := 1 + len(addr) + 2
 		connPayload := make([]byte, reqLen)
-		connPayload[0] = byte(addrLen)
-		copy(connPayload[1:1+addrLen], addr)
-		copy(connPayload[1+addrLen:], portBuf)
+		connPayload[0] = byte(len(addr))
+		copy(connPayload[1:1+len(addr)], addr)
+		binary.BigEndian.PutUint16(connPayload[1+len(addr):], targetPort)
 
 		fb := framePool.Get().([]byte)
 		frameLen := 7 + reqLen
@@ -1164,22 +1781,16 @@ func (c *AdaptiveDispatcher) DialProxy(conn net.Conn) {
 		binary.BigEndian.PutUint32(fb[1:5], pc.connID)
 		binary.BigEndian.PutUint16(fb[5:7], uint16(reqLen))
 		copy(fb[7:], connPayload)
-		c.SendChunk(fb)
-		framePool.Put(fb[:cap(fb)])
-
-		select {
-		case <-pc.connectAckCh:
-		case <-pc.connectErrCh:
-			log.Printf("[CLI] 拒绝: 服务端拒绝代理或目标连接失败 -> %s", addr)
-			return
-		case <-pc.done:
-			return
-		case <-time.After(35 * time.Second):
-			log.Printf("[CLI] 超时: 等待服务端响应超时 -> %s (请检查服务端控制台输出)", addr)
+		if !c.SendChunk(fb) {
+			framePool.Put(fb[:cap(fb)])
 			return
 		}
+		pc.touch()
+		framePool.Put(fb[:cap(fb)])
 
-		conn.Write([]byte{0x00, 0x00})
+		if writeOK != nil && !writeOK() {
+			return
+		}
 
 		go func() {
 			for {
@@ -1188,10 +1799,14 @@ func (c *AdaptiveDispatcher) DialProxy(conn net.Conn) {
 					return
 				case p, ok := <-pc.wc:
 					if !ok {
+						pc.closeLocal()
 						return
 					}
-					pc.conn.SetWriteDeadline(time.Now().Add(3 * time.Second))
+					pc.touch()
+					pc.conn.SetWriteDeadline(time.Now().Add(LocalWriteTimeout))
 					if _, err := pc.conn.Write(p); err != nil {
+						c.sendCloseFrame(pc.connID)
+						pc.closeLocal()
 						return
 					}
 					pc.conn.SetWriteDeadline(time.Time{})
@@ -1199,10 +1814,11 @@ func (c *AdaptiveDispatcher) DialProxy(conn net.Conn) {
 			}
 		}()
 
-		buf := make([]byte, 32768)
+		buf := make([]byte, LocalReadBufferSize)
 		for {
 			n, err := conn.Read(buf)
 			if n > 0 {
+				pc.touch()
 				df := framePool.Get().([]byte)
 				dfLen := 7 + n
 				if cap(df) < dfLen {
@@ -1213,10 +1829,26 @@ func (c *AdaptiveDispatcher) DialProxy(conn net.Conn) {
 				binary.BigEndian.PutUint32(df[1:5], pc.connID)
 				binary.BigEndian.PutUint16(df[5:7], uint16(n))
 				copy(df[7:], buf[:n])
-				c.SendChunk(df)
+				if !c.SendChunk(df) {
+					framePool.Put(df[:cap(df)])
+					return
+				}
 				framePool.Put(df[:cap(df)])
 			}
 			if err != nil {
+				if pc.cl.Load() {
+					hardClose = false
+					return
+				}
+				if err == io.EOF {
+					hardClose = false
+					c.sendFinFrame(pc.connID)
+					select {
+					case <-pc.done:
+					case <-time.After(2 * time.Minute):
+						hardClose = true
+					}
+				}
 				return
 			}
 		}
@@ -1239,11 +1871,12 @@ type AppConfig struct {
 }
 
 var (
-	globalConfig AppConfig
-	configMu     sync.RWMutex
-	currentDisp  *AdaptiveDispatcher
-	dispMu       sync.Mutex
-	vlessLN      net.Listener
+	globalConfig  AppConfig
+	configMu      sync.RWMutex
+	currentDisp   *AdaptiveDispatcher
+	dispMu        sync.Mutex
+	localProxyLN  net.Listener
+	localProxyUDP *net.UDPConn
 )
 
 func initConfig() {
@@ -1271,10 +1904,6 @@ func applyEngine() {
 		currentDisp.Close()
 		currentDisp = nil
 	}
-	if vlessLN != nil {
-		vlessLN.Close()
-		vlessLN = nil
-	}
 	configMu.RLock()
 	en := globalConfig.Enable
 	nid := globalConfig.ActiveNodeID
@@ -1290,11 +1919,35 @@ func applyEngine() {
 		return
 	}
 	currentDisp = NewAdaptiveDispatcher(*actNode)
-	ln, err := net.Listen("tcp", VLESSListenAddr)
-	if err != nil {
-		return
+}
+
+func ensureLocalProxyListener() error {
+	dispMu.Lock()
+	if localProxyLN != nil {
+		dispMu.Unlock()
+		return nil
 	}
-	vlessLN = ln
+	ln, err := net.Listen("tcp", LocalProxyListenAddr)
+	if err != nil {
+		dispMu.Unlock()
+		return err
+	}
+	udpAddr, err := net.ResolveUDPAddr("udp", LocalProxyListenAddr)
+	if err != nil {
+		ln.Close()
+		dispMu.Unlock()
+		return err
+	}
+	uc, err := net.ListenUDP("udp", udpAddr)
+	if err != nil {
+		ln.Close()
+		dispMu.Unlock()
+		return err
+	}
+	localProxyLN = ln
+	localProxyUDP = uc
+	dispMu.Unlock()
+
 	go func() {
 		for {
 			c, err := ln.Accept()
@@ -1305,12 +1958,48 @@ func applyEngine() {
 			d := currentDisp
 			dispMu.Unlock()
 			if d != nil {
-				d.DialProxy(c)
+				go func(conn net.Conn, disp *AdaptiveDispatcher) {
+					defer func() {
+						if r := recover(); r != nil {
+							log.Printf("[CLI] local proxy handler panic: %v", r)
+							conn.Close()
+						}
+					}()
+					if tc, ok := conn.(*net.TCPConn); ok {
+						tc.SetNoDelay(true)
+						tc.SetKeepAlive(true)
+						tc.SetKeepAlivePeriod(30 * time.Second)
+					}
+					disp.DialProxy(conn)
+				}(c, d)
 			} else {
 				c.Close()
 			}
 		}
 	}()
+	go localProxyUDPLoop(uc)
+	return nil
+}
+
+func localProxyUDPLoop(uc *net.UDPConn) {
+	buf := make([]byte, 65535)
+	for {
+		n, addr, err := uc.ReadFromUDP(buf)
+		if err != nil {
+			return
+		}
+		payload, ok := parseSOCKS5UDPDatagram(buf[:n])
+		if !ok {
+			continue
+		}
+		dispMu.Lock()
+		d := currentDisp
+		dispMu.Unlock()
+		if d == nil {
+			continue
+		}
+		d.sendUDPDatagramFromLocal(addr, payload)
+	}
 }
 
 func handleAPI(w http.ResponseWriter, r *http.Request) {
@@ -1338,13 +2027,17 @@ func handleAPI(w http.ResponseWriter, r *http.Request) {
 
 func main() {
 	runtime.GOMAXPROCS(runtime.NumCPU())
-	vlessPort := flag.String("listen", "0.0.0.0:11080", "VLESS listen address")
+	debug.SetGCPercent(200)
+	localProxyAddr := flag.String("listen", "0.0.0.0:11080", "SOCKS5/HTTP local proxy listen address")
 	panelPort := flag.String("panel", "0.0.0.0:9999", "Web panel listen address")
 	cfgFile := flag.String("config", "aether_client.json", "Config file path")
 	flag.Parse()
 	ClientCfgFile = *cfgFile
-	VLESSListenAddr = *vlessPort
+	LocalProxyListenAddr = *localProxyAddr
 	initConfig()
+	if err := ensureLocalProxyListener(); err != nil {
+		log.Fatalf("[CLI] local SOCKS5/HTTP proxy listen failed on %s: %v", LocalProxyListenAddr, err)
+	}
 	applyEngine()
 	http.HandleFunc("/api", handleAPI)
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
@@ -1354,7 +2047,7 @@ func main() {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		w.Write([]byte(clientHTML))
 	})
-	log.Printf("[CLI] Panel: %s, VLESS: %s", *panelPort, *vlessPort)
+	log.Printf("[CLI] Panel: %s, SOCKS5/HTTP: %s", *panelPort, *localProxyAddr)
 	http.ListenAndServe(*panelPort, nil)
 }
 
@@ -1415,7 +2108,7 @@ body{background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSy
 <body>
 <div class="c">
   <div class="hd">
-    <div><h1 id="title">&#128992; SuperYellow Proxy</h1><div class="sub">Multi-stream VLESS Tunnel with FEC</div></div>
+    <div><h1 id="title">&#128992; SuperYellow Proxy</h1><div class="sub">SOCKS5/HTTP Gateway over Aether FEC</div></div>
     <div><button id="toggleBtn" class="btn btn-gn" onclick="toggle()">&#9654; 启动引擎</button></div>
   </div>
 
@@ -1423,14 +2116,14 @@ body{background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSy
     <div class="st"><div class="lb">引擎状态</div><div class="vl" id="s1">-</div></div>
     <div class="st"><div class="lb">节点数量</div><div class="vl ac" id="s2">-</div></div>
     <div class="st"><div class="lb">当前节点</div><div class="vl" id="s3" style="font-size:15px">-</div></div>
-    <div class="st"><div class="lb">本地端口</div><div class="vl" style="font-size:15px;font-family:monospace">:11081</div></div>
+    <div class="st"><div class="lb">本地端口</div><div class="vl" style="font-size:15px;font-family:monospace">:11080</div></div>
   </div>
 
   <div class="cr">
     <div class="tb">
       <h2>&#128225; 节点列表</h2>
       <div class="cg">
-        <button class="btn btn-g btn-sm" onclick="copyVless()">&#128279; 复制链接</button>
+        <button class="btn btn-g btn-sm" onclick="copyLocalProxy()">&#128279; 复制接入</button>
         <button class="btn btn-g btn-sm" onclick="copyJson()">&#128203; 复制配置</button>
         <button class="btn btn-p btn-sm" onclick="openModal(null)">+ 添加节点</button>
       </div>
@@ -1586,11 +2279,9 @@ function delNode(id){
   save();showToast('已删除');
 }
 
-function copyVless(){
-  var n=conf.nodes.find(function(x){return x.id===conf.active_node_id});
-  if(!n){alert('请先选择一个节点');return}
-  var link='vless://'+encodeURIComponent(n.username)+'@'+n.server+'?encryption=none&security=tcp&sni='+(n.sni||'')+'&type=tcp&headerType=none#'+encodeURIComponent(n.name);
-  copyText(link);showToast('VLESS 链接已复制');
+function copyLocalProxy(){
+  copyText('SOCKS5 / HTTP CONNECT\nHost: 127.0.0.1\nPort: 11080\nAuth: none\nPassWall node type: Socks or HTTP');
+  showToast('本地接入信息已复制');
 }
 
 function copyJson(){
