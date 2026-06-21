@@ -6,6 +6,7 @@ import (
 	"bufio"
 	"bytes"
 	"crypto/sha256"
+	"crypto/x509"
 	"encoding/binary"
 	"encoding/json"
 	"flag"
@@ -18,6 +19,7 @@ import (
 	"runtime"
 	"runtime/debug"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -28,6 +30,7 @@ import (
 
 const (
 	NumStreams           = 6
+	DataBuckets          = 8
 	MSS                  = 1350
 	HeaderSize           = 30
 	Magic                = 0x41455448
@@ -38,7 +41,8 @@ const (
 	AdaptiveFECFlag      = 0x0008
 	ControlFrameFlag     = 0x0010
 	FastLaneFlag         = 0x0020
-	ProtocolVersion      = 3
+	NackFlag             = 0x0040
+	ProtocolVersion      = 5
 	AetherALPN           = "http/1.1"
 	DialTimeout          = 15 * time.Second
 	HandshakeTimeout     = 15 * time.Second
@@ -52,11 +56,14 @@ const (
 	MaxReassemblerBuf    = 64 << 20
 	ReassemblerOutputCap = 2048
 	SmallPacketFastLen   = 1200
-	ReassemblerGapTTL    = 6 * time.Second
+	ReassemblerGapTTL    = 4 * time.Second
+	NackRetryInterval    = 700 * time.Millisecond
+	NackMaxAttempts      = 4
+	RetransmitCacheSeqs  = 8192
 	TunnelWriteTimeout   = 5 * time.Second
 	LocalWriteTimeout    = 5 * time.Second
 	ProxyIdleTimeout     = 3 * time.Minute
-	LocalReadBufferSize  = 5*MSS - 7
+	LocalReadBufferSize  = 4*MSS - 7
 	DebugLogging         = false
 )
 
@@ -76,12 +83,21 @@ func debugf(format string, args ...interface{}) {
 	}
 }
 
+func shouldLogEvery(slot *atomic.Int64, interval time.Duration) bool {
+	now := time.Now().UnixNano()
+	last := slot.Load()
+	if now-last < interval.Nanoseconds() {
+		return false
+	}
+	return slot.CompareAndSwap(last, now)
+}
+
 func getEncoder(ds, ps int) reedsolomon.Encoder {
 	if ds <= 0 {
 		ds = 4
 	}
 	if ps <= 0 {
-		ps = 1
+		ps = 2
 	}
 	key := (uint32(ds) << 16) | uint32(ps)
 	if v, ok := fecPool.Load(key); ok {
@@ -252,6 +268,14 @@ func (h *PacketHeader) SetFEC(ds uint8, ps uint8) {
 	h.Reserved = (h.Reserved & 0xFFFFFF00) | ProtocolVersion
 }
 
+func (h *PacketHeader) SetBucket(bucket uint8) {
+	h.Reserved = (h.Reserved & 0xFFFF00FF) | (uint32(bucket) << 8)
+}
+
+func (h *PacketHeader) GetBucket() uint8 {
+	return uint8((h.Reserved >> 8) & 0xFF)
+}
+
 type parsedFrame struct {
 	Type    byte
 	ConnID  uint32
@@ -299,6 +323,79 @@ type TCPReassemblerEntry struct {
 	ds, ps    uint8
 }
 
+type RetransmitCache struct {
+	mu    sync.Mutex
+	m     map[uint64]map[uint16][]byte
+	order []uint64
+	max   int
+}
+
+func NewRetransmitCache(max int) *RetransmitCache {
+	return &RetransmitCache{m: make(map[uint64]map[uint16][]byte), max: max}
+}
+
+func rtxKey(bucket uint8, seq uint32) uint64 {
+	return (uint64(bucket) << 32) | uint64(seq)
+}
+
+func splitRtxKey(key uint64) (uint8, uint32) {
+	return uint8(key >> 32), uint32(key)
+}
+
+func (rc *RetransmitCache) Store(bucket uint8, seq uint32, shard uint16, pkt []byte) {
+	if rc == nil || len(pkt) == 0 {
+		return
+	}
+	cp := make([]byte, len(pkt))
+	copy(cp, pkt)
+	key := rtxKey(bucket, seq)
+	rc.mu.Lock()
+	if rc.m[key] == nil {
+		rc.m[key] = make(map[uint16][]byte)
+		rc.order = append(rc.order, key)
+		for len(rc.order) > rc.max {
+			old := rc.order[0]
+			rc.order = rc.order[1:]
+			delete(rc.m, old)
+		}
+	}
+	rc.m[key][shard] = cp
+	rc.mu.Unlock()
+}
+
+func (rc *RetransmitCache) Get(bucket uint8, seq uint32) [][]byte {
+	if rc == nil {
+		return nil
+	}
+	rc.mu.Lock()
+	defer rc.mu.Unlock()
+	shards := rc.m[rtxKey(bucket, seq)]
+	if len(shards) == 0 {
+		return nil
+	}
+	out := make([][]byte, 0, len(shards))
+	for _, pkt := range shards {
+		cp := make([]byte, len(pkt))
+		copy(cp, pkt)
+		out = append(out, cp)
+	}
+	return out
+}
+
+func (rc *RetransmitCache) Stats() (count int, oldestBucket uint8, oldest uint32, newestBucket uint8, newest uint32) {
+	if rc == nil {
+		return 0, 0, 0, 0, 0
+	}
+	rc.mu.Lock()
+	defer rc.mu.Unlock()
+	count = len(rc.m)
+	if len(rc.order) > 0 {
+		oldestBucket, oldest = splitRtxKey(rc.order[0])
+		newestBucket, newest = splitRtxKey(rc.order[len(rc.order)-1])
+	}
+	return count, oldestBucket, oldest, newestBucket, newest
+}
+
 type decodedRecord struct {
 	decodedAt time.Time
 }
@@ -308,9 +405,11 @@ type TCPReassembler struct {
 	windows         map[uint32]*TCPReassemblerEntry
 	decoded         map[uint32]*decodedRecord
 	outputCh        chan []byte
+	nackCh          chan uint32
 	clientID        uint32
 	cleanupTicker   *time.Ticker
 	stopCh          chan struct{}
+	reasmCh         chan reasmEvent
 	decodedTTL      time.Duration
 	closeOnce       sync.Once
 	wcOnce          sync.Once
@@ -319,6 +418,9 @@ type TCPReassembler struct {
 	readyBuffer     map[uint32][]byte
 	bufferedBytes   int
 	lastAdvance     time.Time
+	gapNackSeq      uint32
+	gapNackAttempts int
+	lastNack        time.Time
 }
 
 func NewTCPReassembler(cid uint32, ttl time.Duration) *TCPReassembler {
@@ -326,6 +428,7 @@ func NewTCPReassembler(cid uint32, ttl time.Duration) *TCPReassembler {
 		windows:     make(map[uint32]*TCPReassemblerEntry),
 		decoded:     make(map[uint32]*decodedRecord),
 		outputCh:    make(chan []byte, ReassemblerOutputCap),
+		nackCh:      make(chan uint32, 64),
 		clientID:    cid,
 		stopCh:      make(chan struct{}),
 		decodedTTL:  ttl,
@@ -333,11 +436,11 @@ func NewTCPReassembler(cid uint32, ttl time.Duration) *TCPReassembler {
 		lastAdvance: time.Now(),
 	}
 	cleanupInterval := ttl / 4
-	if cleanupInterval > 2*time.Second {
-		cleanupInterval = 2 * time.Second
+	if cleanupInterval > 500*time.Millisecond {
+		cleanupInterval = 500 * time.Millisecond
 	}
-	if cleanupInterval < time.Second {
-		cleanupInterval = time.Second
+	if cleanupInterval < 200*time.Millisecond {
+		cleanupInterval = 200 * time.Millisecond
 	}
 	ar.cleanupTicker = time.NewTicker(cleanupInterval)
 	go ar.cleanupLoop()
@@ -364,7 +467,7 @@ func (ar *TCPReassembler) AddShard(seqNo uint32, shardIdx uint16, chunkSize uint
 		return
 	}
 	if ds == 0 {
-		ds, ps = 4, 1
+		ds, ps = 4, 2
 	}
 	e, ok := ar.windows[seqNo]
 	if !ok {
@@ -473,19 +576,29 @@ func (ar *TCPReassembler) drainReady() {
 			case <-ar.stopCh:
 				return
 			default:
-				log.Printf("[WARN] reassembler output queue full: expected=%d buffered=%d, restarting engine", ar.nextExpectedSeq, ar.bufferedBytes)
+				log.Printf("[WARN] reassembler output queue full: expected=%d buffered=%d, closing reassembler", ar.nextExpectedSeq, ar.bufferedBytes)
 				ar.Close()
 				return
 			}
 		} else {
-			log.Printf("[WARN] FEC seq %d 暂不可恢复，等待后续 parity 或重传窗口", ar.nextExpectedSeq)
-			break
+			select {
+			case ar.outputCh <- nil:
+			case <-ar.stopCh:
+				return
+			default:
+				log.Printf("[WARN] reassembler gap marker blocked: expected=%d buffered=%d", ar.nextExpectedSeq, ar.bufferedBytes)
+				ar.Close()
+				return
+			}
 		}
 
 		delete(ar.readyBuffer, ar.nextExpectedSeq)
 		ar.bufferedBytes -= len(payload)
 		ar.nextExpectedSeq++
 		ar.lastAdvance = time.Now()
+		ar.gapNackSeq = 0
+		ar.gapNackAttempts = 0
+		ar.lastNack = time.Time{}
 	}
 
 	for s := range ar.readyBuffer {
@@ -503,6 +616,49 @@ func (ar *TCPReassembler) Output() <-chan []byte {
 	return ar.outputCh
 }
 
+func (ar *TCPReassembler) NACK() <-chan uint32 {
+	return ar.nackCh
+}
+
+func (ar *TCPReassembler) failGapLocked(now time.Time) {
+	skipTo := ar.nextExpectedSeq + 1
+	for seq, payload := range ar.readyBuffer {
+		if int32(seq-skipTo) >= 0 {
+			skipTo = seq + 1
+		}
+		if payload != nil {
+			outputPool.Put(payload[:cap(payload)])
+		}
+	}
+	for seq, e := range ar.windows {
+		if int32(seq-skipTo) >= 0 {
+			skipTo = seq + 1
+		}
+		for _, sp := range e.shards {
+			if sp != nil {
+				PutShardPtr(sp)
+			}
+		}
+	}
+	ar.windows = make(map[uint32]*TCPReassemblerEntry)
+	ar.decoded = make(map[uint32]*decodedRecord)
+	ar.readyBuffer = make(map[uint32][]byte)
+	ar.bufferedBytes = 0
+	ar.nextExpectedSeq = skipTo
+	ar.initialized = true
+	ar.gapNackSeq = 0
+	ar.gapNackAttempts = 0
+	ar.lastNack = time.Time{}
+	ar.lastAdvance = now
+	select {
+	case ar.outputCh <- nil:
+	case <-ar.stopCh:
+	default:
+		log.Printf("[WARN] reassembler gap reset marker blocked: expected=%d", ar.nextExpectedSeq)
+		ar.Close()
+	}
+}
+
 func (ar *TCPReassembler) cleanupLoop() {
 	for {
 		select {
@@ -517,11 +673,28 @@ func (ar *TCPReassembler) cleanupLoop() {
 func (ar *TCPReassembler) cleanupStale() {
 	ar.mu.Lock()
 	n := time.Now()
-	if len(ar.readyBuffer) > 0 && n.Sub(ar.lastAdvance) > ReassemblerGapTTL {
-		log.Printf("[WARN] reassembler gap timeout: expected=%d ready=%d buffered=%d", ar.nextExpectedSeq, len(ar.readyBuffer), ar.bufferedBytes)
-		ar.mu.Unlock()
-		ar.Close()
-		return
+	if len(ar.readyBuffer) > 0 && n.Sub(ar.lastAdvance) > NackRetryInterval {
+		seq := ar.nextExpectedSeq
+		if ar.gapNackSeq != seq {
+			ar.gapNackSeq = seq
+			ar.gapNackAttempts = 0
+			ar.lastNack = time.Time{}
+		}
+		if ar.gapNackAttempts < NackMaxAttempts && (ar.lastNack.IsZero() || n.Sub(ar.lastNack) >= NackRetryInterval) {
+			select {
+			case ar.nackCh <- seq:
+			default:
+			}
+			ar.gapNackAttempts++
+			ar.lastNack = n
+			if ar.gapNackAttempts == 2 || ar.gapNackAttempts == NackMaxAttempts {
+				log.Printf("[WARN] reassembler gap seq=%d ready=%d buffered=%d; NACK attempt %d/%d", seq, len(ar.readyBuffer), ar.bufferedBytes, ar.gapNackAttempts, NackMaxAttempts)
+			}
+		}
+		if n.Sub(ar.lastAdvance) > ReassemblerGapTTL && ar.gapNackAttempts >= NackMaxAttempts {
+			log.Printf("[WARN] reassembler gap timeout: expected=%d ready=%d buffered=%d; resetting data window", ar.nextExpectedSeq, len(ar.readyBuffer), ar.bufferedBytes)
+			ar.failGapLocked(n)
+		}
 	}
 	for k, r := range ar.decoded {
 		if int32(k-ar.nextExpectedSeq) < 0 || n.Sub(r.decodedAt) > ar.decodedTTL {
@@ -667,29 +840,53 @@ func (pc *ProxyConn) getUDPAddr() *net.UDPAddr {
 	return &cp
 }
 
+type reasmEvent struct {
+	bucket  uint8
+	control bool
+	nack    bool
+	closed  bool
+	seq     uint32
+	data    []byte
+}
+
+func muxBucket(data []byte) uint8 {
+	if DataBuckets <= 1 || len(data) < 5 {
+		return 0
+	}
+	id := binary.BigEndian.Uint32(data[1:5])
+	return uint8(id % DataBuckets)
+}
+
 type AdaptiveDispatcher struct {
-	node       NodeConfig
-	clientID   uint32
-	streams    []*SafeStream
-	sMu        sync.RWMutex
-	tr         *TCPReassembler
-	cr         *TCPReassembler
-	pfb        []byte
-	cfb        []byte
-	fw         atomic.Uint32
-	cfw        atomic.Uint32
-	conns      sync.Map
-	stopCh     chan struct{}
-	pacing     *TokenBucket
-	currentDS  uint8
-	currentPS  uint8
-	sdm        sync.RWMutex
-	muxWriteMu sync.Mutex
-	udpMu      sync.RWMutex
-	udpAssoc   *ProxyConn
-	udpPeers   sync.Map
-	// 重连控制
-	lastReconnect    time.Time
+	node            NodeConfig
+	clientID        uint32
+	streams         []*SafeStream
+	sMu             sync.RWMutex
+	trs             []*TCPReassembler
+	cr              *TCPReassembler
+	pfbs            [][]byte
+	cfb             []byte
+	fws             []atomic.Uint32
+	cfw             atomic.Uint32
+	conns           sync.Map
+	stopCh          chan struct{}
+	reasmCh         chan reasmEvent
+	pacing          *TokenBucket
+	currentDS       uint8
+	currentPS       uint8
+	sdm             sync.RWMutex
+	muxWriteMu      sync.Mutex
+	udpMu           sync.RWMutex
+	udpAssoc        *ProxyConn
+	udpPeers        sync.Map
+	rtx             *RetransmitCache
+	nackScore       atomic.Int64
+	lastNackMissLog atomic.Int64
+	lastTraffic     atomic.Int64
+	batchMu         sync.Mutex
+	batchBufs       [][]byte
+	batchActive     []bool
+	// 闂佹彃绉风换娑㈠箳瑜嶉崺?	lastReconnect    time.Time
 	reconnectBackoff time.Duration
 	reconnectMu      sync.Mutex
 	closed           atomic.Bool
@@ -698,16 +895,28 @@ type AdaptiveDispatcher struct {
 func NewAdaptiveDispatcher(n NodeConfig) *AdaptiveDispatcher {
 	cid := fastRand()
 	ad := &AdaptiveDispatcher{
-		node:      n,
-		clientID:  cid,
-		streams:   make([]*SafeStream, NumStreams),
-		tr:        NewTCPReassembler(cid, 30*time.Second),
-		cr:        NewTCPReassembler(cid, 30*time.Second),
-		stopCh:    make(chan struct{}),
-		pacing:    NewTokenBucket(1<<30, 64<<20), // 不在应用层限速，让底层 TCP/BBRv3 自己收敛
-		currentDS: 5,
-		currentPS: 1,
+		node:        n,
+		clientID:    cid,
+		streams:     make([]*SafeStream, NumStreams),
+		trs:         make([]*TCPReassembler, DataBuckets),
+		pfbs:        make([][]byte, DataBuckets),
+		fws:         make([]atomic.Uint32, DataBuckets),
+		batchBufs:   make([][]byte, DataBuckets),
+		batchActive: make([]bool, DataBuckets),
+		cr:          NewTCPReassembler(cid, 30*time.Second),
+		stopCh:      make(chan struct{}),
+		reasmCh:     make(chan reasmEvent, DataBuckets*4+4),
+		pacing:      NewTokenBucket(1<<30, 64<<20), // 濞戞挸绉村﹢顏呮償閺冨倹鏆忛悘鐐插€垮娲焻閻曞倻绀夐悹浣叉櫅缁ㄥ磭浠?TCP/BBRv3 闁煎浜滅换渚€寮ㄩ懜鍨異
+		currentDS:   5,
+		currentPS:   1,
+		rtx:         NewRetransmitCache(RetransmitCacheSeqs),
 	}
+	ad.lastTraffic.Store(time.Now().UnixNano())
+	for i := 0; i < DataBuckets; i++ {
+		ad.trs[i] = NewTCPReassembler(cid, 30*time.Second)
+		go ad.pumpReassembler(uint8(i), ad.trs[i], false)
+	}
+	go ad.pumpReassembler(0, ad.cr, true)
 	go ad.prewarmStreams()
 	go ad.monitorHealth()
 	go ad.handleReassembler()
@@ -715,6 +924,35 @@ func NewAdaptiveDispatcher(n NodeConfig) *AdaptiveDispatcher {
 	return ad
 }
 
+func (c *AdaptiveDispatcher) pumpReassembler(bucket uint8, ar *TCPReassembler, control bool) {
+	for {
+		select {
+		case <-c.stopCh:
+			return
+		case <-ar.stopCh:
+			select {
+			case c.reasmCh <- reasmEvent{bucket: bucket, control: control, closed: true}:
+			case <-c.stopCh:
+			}
+			return
+		case d := <-ar.Output():
+			select {
+			case c.reasmCh <- reasmEvent{bucket: bucket, control: control, data: d}:
+			case <-c.stopCh:
+				return
+			}
+		case seq := <-ar.NACK():
+			if control {
+				continue
+			}
+			select {
+			case c.reasmCh <- reasmEvent{bucket: bucket, nack: true, seq: seq}:
+			case <-c.stopCh:
+				return
+			}
+		}
+	}
+}
 func (c *AdaptiveDispatcher) prewarmStreams() {
 	var wg sync.WaitGroup
 	for i := 0; i < NumStreams; i++ {
@@ -748,7 +986,7 @@ func (c *AdaptiveDispatcher) reboot() {
 	if c.closed.Load() {
 		return
 	}
-	log.Printf("[CLI] 🔴 引擎长时间停滞或数据流严重损坏，执行安全热重启...")
+	log.Printf("[CLI] 妫ｅ啯鏆?鐎殿喗娲橀幖鎼佹⒐閹稿孩顦ч梻鍌涙綑娴犵姴顭ㄩ悙鏉戠仐闁轰胶澧楀畵浣该规担宄扮船闂佹彃绉靛畷顖炲锤韫囥儳绀夐柟绗涘棭鏀介悗鐟邦槸閸欏繘鎮滈銏犳闁?..")
 	c.Close()
 	go func() {
 		time.Sleep(500 * time.Millisecond)
@@ -758,7 +996,7 @@ func (c *AdaptiveDispatcher) reboot() {
 
 func (c *AdaptiveDispatcher) Close() {
 	if c.closed.Swap(true) {
-		return // 已经关闭，防止 double-close panic
+		return // 鐎规瓕灏欑划锟犲礂閹惰姤锛旈柨娑樼焸濡茶顫?double-close panic
 	}
 	select {
 	case <-c.stopCh:
@@ -774,7 +1012,11 @@ func (c *AdaptiveDispatcher) Close() {
 		}
 	}
 	c.sMu.Unlock()
-	c.tr.Close()
+	for _, tr := range c.trs {
+		if tr != nil {
+			tr.Close()
+		}
+	}
 	c.cr.Close()
 	c.conns.Range(func(k, v interface{}) bool {
 		pc := v.(*ProxyConn)
@@ -820,6 +1062,12 @@ func TuneTCPConn(conn net.Conn) {
 	}
 }
 
+func normalizeFingerprint(s string) string {
+	s = strings.ToLower(strings.TrimSpace(s))
+	s = strings.ReplaceAll(s, ":", "")
+	s = strings.ReplaceAll(s, " ", "")
+	return s
+}
 func (c *AdaptiveDispatcher) getTlsConfig() *utls.Config {
 	sni := c.node.SNI
 	if sni == "" {
@@ -830,11 +1078,26 @@ func (c *AdaptiveDispatcher) getTlsConfig() *utls.Config {
 			sni = c.node.Server
 		}
 	}
-	return &utls.Config{
+	cfg := &utls.Config{
 		ServerName:         sni,
 		InsecureSkipVerify: true,
 		NextProtos:         []string{AetherALPN},
 	}
+	pin := normalizeFingerprint(c.node.CertSHA256)
+	if pin != "" {
+		cfg.VerifyPeerCertificate = func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
+			if len(rawCerts) == 0 {
+				return fmt.Errorf("server certificate missing")
+			}
+			sum := sha256.Sum256(rawCerts[0])
+			got := fmt.Sprintf("%x", sum[:])
+			if got != pin {
+				return fmt.Errorf("server certificate pin mismatch: got %s", got)
+			}
+			return nil
+		}
+	}
+	return cfg
 }
 
 func (c *AdaptiveDispatcher) dialStream() *SafeStream {
@@ -896,7 +1159,7 @@ func (c *AdaptiveDispatcher) streamReadLoop(st *SafeStream) {
 			return
 		}
 		ds, ps := h.GetFEC()
-		if ds > 0 && ps > 0 && h.Flags&(ControlFrameFlag|FastLaneFlag|PingFlag|PongFlag|AuthFlag) == 0 {
+		if ds > 0 && ps > 0 && h.Flags&(ControlFrameFlag|FastLaneFlag|PingFlag|PongFlag|AuthFlag|NackFlag) == 0 {
 			c.sdm.Lock()
 			c.currentDS = ds
 			c.currentPS = ps
@@ -913,6 +1176,14 @@ func (c *AdaptiveDispatcher) streamReadLoop(st *SafeStream) {
 				st.Close()
 				return
 			}
+		}
+
+		if h.Flags&NackFlag != 0 {
+			if bp != nil {
+				PutShardPtr(bp)
+			}
+			c.retransmitSeq(h.GetBucket()%DataBuckets, h.SeqNo)
+			continue
 		}
 
 		if h.Flags&PingFlag != 0 {
@@ -953,7 +1224,9 @@ func (c *AdaptiveDispatcher) streamReadLoop(st *SafeStream) {
 			if h.Flags&ControlFrameFlag != 0 {
 				c.cr.AddShard(h.SeqNo, h.ShardIdx, h.ChunkSize, bp, ds, ps)
 			} else {
-				c.tr.AddShard(h.SeqNo, h.ShardIdx, h.ChunkSize, bp, ds, ps)
+				bucket := h.GetBucket() % DataBuckets
+				c.lastTraffic.Store(time.Now().UnixNano())
+				c.trs[bucket].AddShard(h.SeqNo, h.ShardIdx, h.ChunkSize, bp, ds, ps)
 			}
 		}
 	}
@@ -967,6 +1240,7 @@ func (c *AdaptiveDispatcher) monitorHealth() {
 		case <-c.stopCh:
 			return
 		case <-tk.C:
+			time.Sleep(time.Duration(fastRand()%2500) * time.Millisecond)
 			var wg sync.WaitGroup
 			var activeCount int32
 			var avgRTT int64
@@ -982,6 +1256,7 @@ func (c *AdaptiveDispatcher) monitorHealth() {
 
 					if st == nil || st.IsClosed() {
 						atomic.AddUint32(&lossCount, 1)
+						time.Sleep(time.Duration(250+fastRand()%750) * time.Millisecond)
 						newSt := c.dialStream()
 						if newSt != nil {
 							c.sMu.Lock()
@@ -992,6 +1267,9 @@ func (c *AdaptiveDispatcher) monitorHealth() {
 					} else {
 						atomic.AddInt32(&activeCount, 1)
 						atomic.AddInt64(&avgRTT, st.srtt.Load())
+						if last := c.lastTraffic.Load(); last > 0 && time.Since(time.Unix(0, last)) < 3*time.Second {
+							return
+						}
 
 						pl := generateSmartPadding(HeaderSize)
 						ts := uint32(time.Now().UnixMilli() & 0xFFFFFFFF)
@@ -1022,15 +1300,18 @@ func (c *AdaptiveDispatcher) monitorHealth() {
 				}(i)
 			}
 			wg.Wait()
+			if score := c.nackScore.Load(); score > 0 {
+				c.nackScore.Store(score * 3 / 4)
+			}
 
 			if activeCount > 0 {
 				avgRTT /= int64(activeCount)
-				// 有存活流，重置退避
+				// Active streams are healthy; reset reconnect backoff.
 				c.reconnectMu.Lock()
 				c.reconnectBackoff = 0
 				c.reconnectMu.Unlock()
 			} else {
-				// 全部流死亡，触发退避重连
+				// All streams are down; advance reconnect backoff and reconnect one by one.
 				c.reconnectMu.Lock()
 				if c.reconnectBackoff == 0 {
 					c.reconnectBackoff = ReconnectBaseDelay
@@ -1043,10 +1324,9 @@ func (c *AdaptiveDispatcher) monitorHealth() {
 				delay := c.reconnectBackoff
 				c.reconnectMu.Unlock()
 
-				log.Printf("[CLI] ⚠️ 全部 %d 条流断开，%v 后开始逐条重连...", NumStreams, delay)
+				log.Printf("[CLI] all %d streams are down; reconnecting after %v", NumStreams, delay)
 				time.Sleep(delay)
 
-				// 逐条重连，间隔 500ms，避免同时拨号冲击服务端
 				for i := 0; i < NumStreams; i++ {
 					select {
 					case <-c.stopCh:
@@ -1059,14 +1339,15 @@ func (c *AdaptiveDispatcher) monitorHealth() {
 					if st != nil && !st.IsClosed() {
 						continue
 					}
+					time.Sleep(time.Duration(250+fastRand()%750) * time.Millisecond)
 					newSt := c.dialStream()
 					if newSt != nil {
 						c.sMu.Lock()
 						c.streams[i] = newSt
 						c.sMu.Unlock()
-						log.Printf("[CLI] ✅ 流 %d 重连成功", i)
+						log.Printf("[CLI] stream %d reconnected", i)
 					} else {
-						log.Printf("[CLI] ❌ 流 %d 重连失败，将在下次周期重试", i)
+						log.Printf("[CLI] stream %d reconnect failed, will retry next cycle", i)
 					}
 					time.Sleep(ReconnectStagger)
 				}
@@ -1077,15 +1358,15 @@ func (c *AdaptiveDispatcher) monitorHealth() {
 			c.sdm.Lock()
 			switch {
 			case activeCount >= 6 && lossRate < 0.08:
-				c.currentDS, c.currentPS = 5, 1
-			case activeCount >= 5 && lossRate > 0.18:
 				c.currentDS, c.currentPS = 4, 2
 			case activeCount >= 5:
-				c.currentDS, c.currentPS = 4, 1
+				c.currentDS, c.currentPS = 3, 2
 			case activeCount >= 4:
-				c.currentDS, c.currentPS = 3, 1
-			default:
+				c.currentDS, c.currentPS = 2, 2
+			case activeCount >= 3:
 				c.currentDS, c.currentPS = 2, 1
+			default:
+				c.currentDS, c.currentPS = 1, 2
 			}
 			c.sdm.Unlock()
 		}
@@ -1130,23 +1411,96 @@ func (c *AdaptiveDispatcher) writeSOCKS5UDP(pc *ProxyConn, payload []byte) {
 	}
 }
 
+func (c *AdaptiveDispatcher) sendNACK(bucket uint8, seq uint32) {
+	c.sMu.RLock()
+	streams := append([]*SafeStream(nil), c.streams...)
+	c.sMu.RUnlock()
+	pl := generateSmartPadding(HeaderSize)
+	h := &PacketHeader{Magic: Magic, ClientID: c.clientID, SeqNo: seq, Flags: NackFlag, PaddingLen: pl, Timestamp: uint32(time.Now().UnixMilli() & 0xFFFFFFFF)}
+	h.SetBucket(bucket)
+	c.nackScore.Add(1)
+	b := make([]byte, HeaderSize+int(pl))
+	h.EncodeTo(b[:HeaderSize])
+	for _, st := range streams {
+		if st != nil && !st.IsClosed() {
+			if _, err := st.Write(b); err != nil {
+				st.Close()
+			}
+		}
+	}
+}
+
+func (c *AdaptiveDispatcher) retransmitSeq(bucket uint8, seq uint32) {
+	pkts := c.rtx.Get(bucket, seq)
+	if len(pkts) == 0 {
+		if shouldLogEvery(&c.lastNackMissLog, 5*time.Second) {
+			count, oldestBucket, oldest, newestBucket, newest := c.rtx.Stats()
+			log.Printf("[CLI] NACK cache miss bucket=%d seq=%d cache_count=%d cache_range=%d:%d..%d:%d", bucket, seq, count, oldestBucket, oldest, newestBucket, newest)
+		}
+		return
+	}
+	c.sMu.RLock()
+	var streams []*SafeStream
+	for _, st := range c.streams {
+		if st != nil && !st.IsClosed() {
+			streams = append(streams, st)
+		}
+	}
+	c.sMu.RUnlock()
+	if len(streams) == 0 {
+		return
+	}
+	for i, pkt := range pkts {
+		st := streams[i%len(streams)]
+		if _, err := st.Write(pkt); err != nil {
+			st.Close()
+		}
+	}
+	debugf("[CLI] retransmitted bucket=%d seq=%d shards=%d", bucket, seq, len(pkts))
+}
+
+func (c *AdaptiveDispatcher) resetProxyConns(reason string) {
+	log.Printf("[WARN] resetting active local proxy conns: %s", reason)
+	c.conns.Range(func(k, v interface{}) bool {
+		pc := v.(*ProxyConn)
+		pc.closeLocal()
+		c.sendCloseFrame(pc.connID)
+		c.conns.Delete(k)
+		return true
+	})
+}
+
 func (c *AdaptiveDispatcher) handleReassembler() {
 	for {
 		select {
 		case <-c.stopCh:
 			return
-		case <-c.tr.stopCh:
-			c.reboot()
-			return
-		case <-c.cr.stopCh:
-			c.reboot()
-			return
-		case d := <-c.tr.Output():
-			if !c.handleReassembledPayload(&c.pfb, d) {
+		case ev := <-c.reasmCh:
+			if ev.closed {
+				c.reboot()
 				return
 			}
-		case d := <-c.cr.Output():
-			if !c.handleReassembledPayload(&c.cfb, d) {
+			if ev.nack {
+				c.sendNACK(ev.bucket, ev.seq)
+				continue
+			}
+			if ev.control {
+				if ev.data == nil {
+					c.cfb = c.cfb[:0]
+					continue
+				}
+				if !c.handleReassembledPayload(&c.cfb, ev.data) {
+					return
+				}
+				continue
+			}
+			bucket := int(ev.bucket % DataBuckets)
+			if ev.data == nil {
+				c.pfbs[bucket] = c.pfbs[bucket][:0]
+				c.resetProxyConns(fmt.Sprintf("data bucket %d reassembler gap", bucket))
+				continue
+			}
+			if !c.handleReassembledPayload(&c.pfbs[bucket], ev.data) {
 				return
 			}
 		}
@@ -1217,7 +1571,55 @@ type streamStat struct {
 }
 
 func (c *AdaptiveDispatcher) SendChunk(data []byte) bool {
-	return c.sendChunk(data, isClientControlFrame(data))
+	control := isClientControlFrame(data)
+	if control {
+		c.flushAllBatches()
+	}
+	return c.sendChunk(data, control)
+}
+
+func (c *AdaptiveDispatcher) enqueueData(data []byte) bool {
+	if c.closed.Load() {
+		return false
+	}
+	bucket := muxBucket(data)
+	cp := make([]byte, len(data))
+	copy(cp, data)
+	var flush []byte
+	c.batchMu.Lock()
+	c.batchBufs[bucket] = append(c.batchBufs[bucket], cp...)
+	if len(c.batchBufs[bucket]) >= LocalReadBufferSize {
+		flush = c.batchBufs[bucket]
+		c.batchBufs[bucket] = nil
+		c.batchActive[bucket] = false
+	} else if !c.batchActive[bucket] {
+		c.batchActive[bucket] = true
+		go func(b uint8) {
+			time.Sleep(time.Duration(1+fastRand()%3) * time.Millisecond)
+			c.flushBatch(b)
+		}(bucket)
+	}
+	c.batchMu.Unlock()
+	if len(flush) > 0 {
+		return c.sendChunk(flush, false)
+	}
+	return true
+}
+
+func (c *AdaptiveDispatcher) flushAllBatches() {
+	for i := 0; i < DataBuckets; i++ {
+		c.flushBatch(uint8(i))
+	}
+}
+func (c *AdaptiveDispatcher) flushBatch(bucket uint8) {
+	c.batchMu.Lock()
+	data := c.batchBufs[bucket]
+	c.batchBufs[bucket] = nil
+	c.batchActive[bucket] = false
+	c.batchMu.Unlock()
+	if len(data) > 0 && !c.closed.Load() {
+		c.sendChunk(data, false)
+	}
 }
 
 func isClientControlFrame(data []byte) bool {
@@ -1230,22 +1632,38 @@ func isClientControlFrame(data []byte) bool {
 	return data[0] == 0x01 || data[0] == 0x03
 }
 
-func chooseClientDataFEC(active, curDS, curPS, remaining int) (int, int) {
+func (c *AdaptiveDispatcher) chooseClientDataFEC(active, curDS, curPS, remaining int) (int, int) {
+	score := c.nackScore.Load()
 	if remaining <= SmallPacketFastLen {
-		return 1, 2
+		if score >= 4 || active <= 3 {
+			return 1, 2
+		}
+		return 1, 1
 	}
 	switch {
 	case active >= 6:
-		if curDS <= 1 || curPS <= 0 {
+		if score == 0 {
 			return 5, 1
 		}
-		return curDS, curPS
+		if score < 4 {
+			return 4, 2
+		}
+		return 3, 3
 	case active == 5:
-		return 4, 2
-	case active == 4:
+		if score < 3 {
+			return 4, 1
+		}
 		return 3, 2
-	case active == 3:
+	case active == 4:
+		if score < 3 {
+			return 3, 1
+		}
 		return 2, 2
+	case active == 3:
+		if score < 3 {
+			return 2, 1
+		}
+		return 1, 2
 	default:
 		return 1, 2
 	}
@@ -1298,16 +1716,19 @@ func (c *AdaptiveDispatcher) sendChunk(data []byte, control bool) bool {
 
 		var ds, ps int
 		var sq uint32
+		var bucket uint8
 		var fastLane bool
 		if control {
 			ds, ps = 1, 2
 			sq = c.cfw.Add(1) - 1
 		} else {
+			bucket = muxBucket(data)
+			c.lastTraffic.Store(time.Now().UnixNano())
 			c.sdm.RLock()
 			ds, ps = int(c.currentDS), int(c.currentPS)
 			c.sdm.RUnlock()
-			ds, ps = chooseClientDataFEC(len(stats), ds, ps, len(data)-o)
-			sq = c.fw.Add(1) - 1
+			ds, ps = c.chooseClientDataFEC(len(stats), ds, ps, len(data)-o)
+			sq = c.fws[bucket].Add(1) - 1
 			fastLane = ds == 1 && ps >= 2
 		}
 
@@ -1365,6 +1786,7 @@ func (c *AdaptiveDispatcher) sendChunk(data []byte, control bool) bool {
 				h.Flags |= FastLaneFlag
 			}
 			h.SetFEC(uint8(ds), uint8(ps))
+			h.SetBucket(bucket)
 
 			buf := buffers[i]
 			h.EncodeTo(buf[:HeaderSize])
@@ -1375,6 +1797,9 @@ func (c *AdaptiveDispatcher) sendChunk(data []byte, control bool) bool {
 			}
 
 			pkt := buf[:pe+int(pl)]
+			if !control {
+				c.rtx.Store(bucket, sq, uint16(i), pkt)
+			}
 			if _, err := st.Write(pkt); err != nil {
 				st.Close()
 			} else {
@@ -1856,12 +2281,13 @@ func (c *AdaptiveDispatcher) DialProxyTarget(conn net.Conn, addr string, targetP
 }
 
 type NodeConfig struct {
-	ID       string `json:"id"`
-	Name     string `json:"name"`
-	Server   string `json:"server"`
-	Username string `json:"username"`
-	Password string `json:"password"`
-	SNI      string `json:"sni"`
+	ID         string `json:"id"`
+	Name       string `json:"name"`
+	Server     string `json:"server"`
+	Username   string `json:"username"`
+	Password   string `json:"password"`
+	SNI        string `json:"sni"`
+	CertSHA256 string `json:"cert_sha256,omitempty"`
 }
 
 type AppConfig struct {
@@ -2109,35 +2535,35 @@ body{background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSy
 <div class="c">
   <div class="hd">
     <div><h1 id="title">&#128992; SuperYellow Proxy</h1><div class="sub">SOCKS5/HTTP Gateway over Aether FEC</div></div>
-    <div><button id="toggleBtn" class="btn btn-gn" onclick="toggle()">&#9654; 启动引擎</button></div>
+    <div><button id="toggleBtn" class="btn btn-gn" onclick="toggle()">&#9654; 闁告凹鍨版慨鈺侇嚕閺囩喐鎯?/button></div>
   </div>
 
   <div class="sb">
-    <div class="st"><div class="lb">引擎状态</div><div class="vl" id="s1">-</div></div>
-    <div class="st"><div class="lb">节点数量</div><div class="vl ac" id="s2">-</div></div>
-    <div class="st"><div class="lb">当前节点</div><div class="vl" id="s3" style="font-size:15px">-</div></div>
-    <div class="st"><div class="lb">本地端口</div><div class="vl" style="font-size:15px;font-family:monospace">:11080</div></div>
+    <div class="st"><div class="lb">鐎殿喗娲橀幖鎼佹偐閼哥鍋?/div><div class="vl" id="s1">-</div></div>
+    <div class="st"><div class="lb">闁煎搫鍊婚崑锝夊极娴兼潙娅?/div><div class="vl ac" id="s2">-</div></div>
+    <div class="st"><div class="lb">鐟滅増鎸告晶鐘绘嚍閸屾粌浠?/div><div class="vl" id="s3" style="font-size:15px">-</div></div>
+    <div class="st"><div class="lb">闁哄牜鍓欏﹢瀵哥博椤栨艾缍?/div><div class="vl" style="font-size:15px;font-family:monospace">:11080</div></div>
   </div>
 
   <div class="cr">
     <div class="tb">
-      <h2>&#128225; 节点列表</h2>
+      <h2>&#128225; 闁煎搫鍊婚崑锝夊礆濡ゅ嫨鈧?/h2>
       <div class="cg">
-        <button class="btn btn-g btn-sm" onclick="copyLocalProxy()">&#128279; 复制接入</button>
-        <button class="btn btn-g btn-sm" onclick="copyJson()">&#128203; 复制配置</button>
-        <button class="btn btn-p btn-sm" onclick="openModal(null)">+ 添加节点</button>
+        <button class="btn btn-g btn-sm" onclick="copyLocalProxy()">&#128279; 濠㈣泛绉撮崺妤呭箳閵夈儱寮?/button>
+        <button class="btn btn-g btn-sm" onclick="copyJson()">&#128203; 濠㈣泛绉撮崺妤呮煀瀹ュ洨鏋?/button>
+        <button class="btn btn-p btn-sm" onclick="openModal(null)">+ 婵烇綀顕ф慨鐐烘嚍閸屾粌浠?/button>
       </div>
     </div>
     <div class="nl" id="nodeList"></div>
   </div>
 
   <div class="cr">
-    <h2>&#128214; 使用说明</h2>
+    <h2>&#128214; 濞达綀娉曢弫銈囨嫚鐎涙ɑ顫?/h2>
     <div style="color:var(--text2);font-size:14px;line-height:1.8">
-      <p>1. 点击「+ 添加节点」填入你的 SuperYellow 服务器信息</p>
-      <p>2. 选中节点后，前往 <strong style="color:var(--text)">PassWall → 节点列表</strong> 选择「SuperYellow」</p>
-      <p>3. 将 PassWall 的 TCP 模式设为「使用列表外代理」即可</p>
-      <p style="margin-top:8px;color:var(--accent)">&#128161; 服务器需要先在 Web 面板注册用户才能连接</p>
+      <p>1. 闁绘劗鎳撻崵顕€濡? 婵烇綀顕ф慨鐐烘嚍閸屾粌浠柕鍡楃Т閿濈偤宕楅妷銈囩☉闁?SuperYellow 闁哄牆绉存慨鐔煎闯閵娿倓绻嗛柟?/p>
+      <p>2. 闂侇偄顦懙鎴︽嚍閸屾粌浠柛姘嚱缁辨繈宕滃鍛獢 <strong style="color:var(--text)">PassWall 闁?闁煎搫鍊婚崑锝夊礆濡ゅ嫨鈧?/strong> 闂侇偄顦扮€氥劑濡寸€涚灝perYellow闁?/p>
+      <p>3. 閻?PassWall 闁?TCP 婵☆垪鈧磭纭€閻犱礁褰炵拹鐔煎Υ鐏炵厧鈻忛柣顫妼閸亞鎮伴妸銉▎濞寸媴绲块幃濠囧Υ瀹ュ懎绁柛?/p>
+      <p style="margin-top:8px;color:var(--accent)">&#128161; 闁哄牆绉存慨鐔煎闯閵娾晜浠橀悷鏇氱閸樻盯宕?Web 闂傚牄鍨哄妯衡枖閵娿儱鏂€闁活潿鍔嶉崺娑㈠箥瀹ュ牆鍘撮弶鈺冨仦鐢?/p>
     </div>
   </div>
 </div>
@@ -2145,17 +2571,17 @@ body{background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSy
 <!-- Modal -->
 <div class="mm" id="modal" onclick="if(event.target===this)closeModal()">
   <div class="md">
-    <h3 id="modalTitle">添加节点</h3>
-    <div class="fg"><label>节点名称</label><input id="fName" placeholder="例：我的服务器"></div>
-    <div class="fg"><label>服务器地址 (IP:端口)</label><input id="fServer" placeholder="例：1.2.3.4:8443" style="font-family:monospace"></div>
+    <h3 id="modalTitle">婵烇綀顕ф慨鐐烘嚍閸屾粌浠?/h3>
+    <div class="fg"><label>闁煎搫鍊婚崑锝夊触瀹ュ泦?/label><input id="fName" placeholder="濞撴艾顑戠槐浼村箣閹寸姵鐣遍柡鍫濈Т婵喖宕?></div>
+    <div class="fg"><label>闁哄牆绉存慨鐔煎闯閵娿儲鍕鹃柛褉鍋?(IP:缂佹棏鍨拌ぐ?</label><input id="fServer" placeholder="濞撴艾顑戠槐?.2.3.4:8443" style="font-family:monospace"></div>
     <div class="fr">
-      <div class="fg"><label>用户名</label><input id="fUser" placeholder="Default"></div>
-      <div class="fg"><label>密码</label><input id="fPass" type="password" placeholder="鉴权密钥"></div>
+      <div class="fg"><label>闁活潿鍔嶉崺娑㈠触?/label><input id="fUser" placeholder="Default"></div>
+      <div class="fg"><label>閻庨潧妫涢悥?/label><input id="fPass" type="password" placeholder="闂佹潙鐡ㄥ鍫⑩偓闈涙閹?></div>
     </div>
-    <div class="fg"><label>SNI (伪装域名)</label><input id="fSni" placeholder="例：chaofanbox.top" style="font-family:monospace"></div>
+    <div class="fg"><label>SNI (濞寸⒈浜ｉˉ濠囧春閻旈攱鍊?</label><input id="fSni" placeholder="濞撴艾顑戠槐鐧県aofanbox.top" style="font-family:monospace"></div>
     <div class="ma">
-      <button class="btn btn-g" onclick="closeModal()">取消</button>
-      <button class="btn btn-p" onclick="saveNode()">保存</button>
+      <button class="btn btn-g" onclick="closeModal()">闁告瑦鐗楃粔?/button>
+      <button class="btn btn-p" onclick="saveNode()">濞ｅ洦绻傞悺?/button>
     </div>
   </div>
 </div>
@@ -2179,29 +2605,29 @@ function render(){
   var dot=document.getElementById('title');
   dot.innerHTML='<span style="display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:8px;background:'+(running?'#22c55e;box-shadow:0 0 10px rgba(34,197,94,.6)':'#ef4444')+'"></span>SuperYellow Proxy';
 
-  document.getElementById('s1').innerHTML=running?'<span class="on">运行中</span>':'<span class="off">已停止</span>';
+  document.getElementById('s1').innerHTML=running?'<span class="on">閺夆晜鍔橀、鎴炵▔?/span>':'<span class="off">鐎瑰憡褰冩禒鐘差潰?/span>';
   document.getElementById('s2').textContent=conf.nodes.length;
   var an=conf.nodes.find(function(n){return n.id===conf.active_node_id});
-  document.getElementById('s3').textContent=an?an.name:'未选择';
+  document.getElementById('s3').textContent=an?an.name:'闁哄牜浜埀顒€顦扮€?;
 
   var btn=document.getElementById('toggleBtn');
-  if(running){btn.className='btn btn-r';btn.innerHTML='&#9632; 停止引擎'}
-  else{btn.className='btn btn-gn';btn.innerHTML='&#9654; 启动引擎'}
+  if(running){btn.className='btn btn-r';btn.innerHTML='&#9632; 闁稿绮嶉娑橆嚕閺囩喐鎯?}
+  else{btn.className='btn btn-gn';btn.innerHTML='&#9654; 闁告凹鍨版慨鈺侇嚕閺囩喐鎯?}
 
   var list=document.getElementById('nodeList');
   if(conf.nodes.length===0){
-    list.innerHTML='<div class="emp"><div style="font-size:32px;margin-bottom:8px">&#128225;</div>还没有配置节点，点击右上角「+ 添加节点」开始</div>';
+    list.innerHTML='<div class="emp"><div style="font-size:32px;margin-bottom:8px">&#128225;</div>閺夆晜蓱閻ュ懘寮垫径鎰赋缂傚喚鍠涙俊顓㈡倷閻у摜绀夐柣鎰嚀閸ゎ噣宕ｉ崗鍛憪閻熸瑦甯囬埀? 婵烇綀顕ф慨鐐烘嚍閸屾粌浠柕鍡楃Т缁辨垶鎱?/div>';
     return;
   }
   var h='';
   conf.nodes.forEach(function(n){
     var act=n.id===conf.active_node_id;
     h+='<div class="nd'+(act?' act':'')+'" onclick="selectNode(\''+n.id+'\')">';
-    h+='<div><div class="nm">'+esc(n.name)+(act?'<span class="badge">当前</span>':'')+'</div>';
+    h+='<div><div class="nm">'+esc(n.name)+(act?'<span class="badge">鐟滅増鎸告晶?/span>':'')+'</div>';
     h+='<div class="ad">'+esc(n.server)+' &middot; '+esc(n.username)+'</div></div>';
     h+='<div class="acts">';
-    h+='<button class="btn btn-g btn-sm" onclick="event.stopPropagation();openModal(\''+n.id+'\')">&#9998; 编辑</button>';
-    h+='<button class="btn btn-d btn-sm" onclick="event.stopPropagation();delNode(\''+n.id+'\')">&#128465; 删除</button>';
+    h+='<button class="btn btn-g btn-sm" onclick="event.stopPropagation();openModal(\''+n.id+'\')">&#9998; 缂傚倹鐗炵欢?/button>';
+    h+='<button class="btn btn-d btn-sm" onclick="event.stopPropagation();delNode(\''+n.id+'\')">&#128465; 闁告帞濞€濞?/button>';
     h+='</div></div>';
   });
   list.innerHTML=h;
@@ -2230,14 +2656,14 @@ function openModal(id){
   if(id){
     var n=conf.nodes.find(function(x){return x.id===id});
     if(!n)return;
-    document.getElementById('modalTitle').textContent='编辑节点';
+    document.getElementById('modalTitle').textContent='缂傚倹鐗炵欢顐︽嚍閸屾粌浠?;
     document.getElementById('fName').value=n.name;
     document.getElementById('fServer').value=n.server;
     document.getElementById('fUser').value=n.username;
     document.getElementById('fPass').value=n.password;
     document.getElementById('fSni').value=n.sni||'';
   }else{
-    document.getElementById('modalTitle').textContent='添加节点';
+    document.getElementById('modalTitle').textContent='婵烇綀顕ф慨鐐烘嚍閸屾粌浠?;
     document.getElementById('fName').value='';
     document.getElementById('fServer').value='';
     document.getElementById('fUser').value='Default';
@@ -2253,7 +2679,7 @@ function closeModal(){document.getElementById('modal').className='mm'}
 function saveNode(){
   var name=document.getElementById('fName').value.trim();
   var server=document.getElementById('fServer').value.trim();
-  if(!name||!server){alert('名称和服务器地址不能为空');return}
+  if(!name||!server){alert('闁告艾绉惰ⅷ闁告粌鏈﹢鍥礉閳ヨ櫕鐝ら柛锔芥緲濞煎啯绋夊鍫濆幋濞戞捁娅ｉ埞?);return}
   var obj={
     name:name,server:server,
     username:document.getElementById('fUser').value.trim()||'Default',
@@ -2268,24 +2694,24 @@ function saveNode(){
     conf.nodes.push(obj);
     if(conf.nodes.length===1)conf.active_node_id=obj.id;
   }
-  closeModal();save();showToast('已保存');
+  closeModal();save();showToast('鐎规瓕寮撶换姘扁偓?);
 }
 
 function delNode(id){
   var n=conf.nodes.find(function(x){return x.id===id});
-  if(!confirm('确定删除「'+(n?n.name:'')+'」？'))return;
+  if(!confirm('缁绢収鍠栭悾楣冨礆閻樼粯鐝熼柕?+(n?n.name:'')+'闁靛棗绋勭槐?))return;
   conf.nodes=conf.nodes.filter(function(x){return x.id!==id});
   if(conf.active_node_id===id)conf.active_node_id=conf.nodes.length?conf.nodes[0].id:'';
-  save();showToast('已删除');
+  save();showToast('鐎瑰憡褰冮崹褰掓⒔?);
 }
 
 function copyLocalProxy(){
   copyText('SOCKS5 / HTTP CONNECT\nHost: 127.0.0.1\nPort: 11080\nAuth: none\nPassWall node type: Socks or HTTP');
-  showToast('本地接入信息已复制');
+  showToast('闁哄牜鍓欏﹢鎾箳閵夈儱寮冲ǎ鍥ｅ墲娴煎懎顔忛幓鎺濇Щ闁?);
 }
 
 function copyJson(){
-  copyText(JSON.stringify(conf,null,2));showToast('配置 JSON 已复制');
+  copyText(JSON.stringify(conf,null,2));showToast('闂佹澘绉堕悿?JSON 鐎瑰憡褰冮ˇ鏌ュ礆?);
 }
 
 function copyText(t){

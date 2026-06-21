@@ -34,6 +34,7 @@ import (
 
 const (
 	NumStreams       = 6
+	DataBuckets      = 8
 	DataShards       = 5
 	ParityShards     = 1
 	MSS              = 1350
@@ -46,7 +47,8 @@ const (
 	AdaptiveFECFlag  = 0x0008
 	ControlFrameFlag = 0x0010
 	FastLaneFlag     = 0x0020
-	ProtocolVersion  = 3
+	NackFlag         = 0x0040
+	ProtocolVersion  = 5
 	AetherALPN       = "http/1.1"
 
 	TargetDialTimeout  = 30 * time.Second
@@ -60,7 +62,10 @@ const (
 	MaxReassemblerBuf    = 64 << 20
 	ReassemblerOutputCap = 2048
 	SmallPacketFastLen   = 1200
-	ReassemblerGapTTL    = 6 * time.Second
+	ReassemblerGapTTL    = 4 * time.Second
+	NackRetryInterval    = 700 * time.Millisecond
+	NackMaxAttempts      = 4
+	RetransmitCacheSeqs  = 8192
 	TunnelWriteTimeout   = 5 * time.Second
 	TargetConnIdleTTL    = 5 * time.Minute
 	DebugLogging         = false
@@ -87,6 +92,15 @@ func debugf(format string, args ...interface{}) {
 	if DebugLogging {
 		log.Printf(format, args...)
 	}
+}
+
+func shouldLogEvery(slot *atomic.Int64, interval time.Duration) bool {
+	now := time.Now().UnixNano()
+	last := slot.Load()
+	if now-last < interval.Nanoseconds() {
+		return false
+	}
+	return slot.CompareAndSwap(last, now)
 }
 
 func getEncoder(ds, ps int) reedsolomon.Encoder {
@@ -358,6 +372,14 @@ func (h *PacketHeader) SetFEC(ds uint8, ps uint8) {
 	h.Reserved = (h.Reserved & 0xFFFFFF00) | ProtocolVersion
 }
 
+func (h *PacketHeader) SetBucket(bucket uint8) {
+	h.Reserved = (h.Reserved & 0xFFFF00FF) | (uint32(bucket) << 8)
+}
+
+func (h *PacketHeader) GetBucket() uint8 {
+	return uint8((h.Reserved >> 8) & 0xFF)
+}
+
 type parsedFrame struct {
 	Type    byte
 	ConnID  uint32
@@ -427,6 +449,79 @@ type TCPReassemblerEntry struct {
 	ds, ps    uint8
 }
 
+type RetransmitCache struct {
+	mu    sync.Mutex
+	m     map[uint64]map[uint16][]byte
+	order []uint64
+	max   int
+}
+
+func NewRetransmitCache(max int) *RetransmitCache {
+	return &RetransmitCache{m: make(map[uint64]map[uint16][]byte), max: max}
+}
+
+func rtxKey(bucket uint8, seq uint32) uint64 {
+	return (uint64(bucket) << 32) | uint64(seq)
+}
+
+func splitRtxKey(key uint64) (uint8, uint32) {
+	return uint8(key >> 32), uint32(key)
+}
+
+func (rc *RetransmitCache) Store(bucket uint8, seq uint32, shard uint16, pkt []byte) {
+	if rc == nil || len(pkt) == 0 {
+		return
+	}
+	cp := make([]byte, len(pkt))
+	copy(cp, pkt)
+	key := rtxKey(bucket, seq)
+	rc.mu.Lock()
+	if rc.m[key] == nil {
+		rc.m[key] = make(map[uint16][]byte)
+		rc.order = append(rc.order, key)
+		for len(rc.order) > rc.max {
+			old := rc.order[0]
+			rc.order = rc.order[1:]
+			delete(rc.m, old)
+		}
+	}
+	rc.m[key][shard] = cp
+	rc.mu.Unlock()
+}
+
+func (rc *RetransmitCache) Get(bucket uint8, seq uint32) [][]byte {
+	if rc == nil {
+		return nil
+	}
+	rc.mu.Lock()
+	defer rc.mu.Unlock()
+	shards := rc.m[rtxKey(bucket, seq)]
+	if len(shards) == 0 {
+		return nil
+	}
+	out := make([][]byte, 0, len(shards))
+	for _, pkt := range shards {
+		cp := make([]byte, len(pkt))
+		copy(cp, pkt)
+		out = append(out, cp)
+	}
+	return out
+}
+
+func (rc *RetransmitCache) Stats() (count int, oldestBucket uint8, oldest uint32, newestBucket uint8, newest uint32) {
+	if rc == nil {
+		return 0, 0, 0, 0, 0
+	}
+	rc.mu.Lock()
+	defer rc.mu.Unlock()
+	count = len(rc.m)
+	if len(rc.order) > 0 {
+		oldestBucket, oldest = splitRtxKey(rc.order[0])
+		newestBucket, newest = splitRtxKey(rc.order[len(rc.order)-1])
+	}
+	return count, oldestBucket, oldest, newestBucket, newest
+}
+
 type decodedRecord struct {
 	decodedAt time.Time
 }
@@ -436,6 +531,7 @@ type TCPReassembler struct {
 	windows         map[uint32]*TCPReassemblerEntry
 	decoded         map[uint32]*decodedRecord
 	outputCh        chan []byte
+	nackCh          chan uint32
 	clientID        uint32
 	cleanupTicker   *time.Ticker
 	stopCh          chan struct{}
@@ -446,6 +542,9 @@ type TCPReassembler struct {
 	readyBuffer     map[uint32][]byte
 	bufferedBytes   int
 	lastAdvance     time.Time
+	gapNackSeq      uint32
+	gapNackAttempts int
+	lastNack        time.Time
 }
 
 func NewTCPReassembler(cid uint32, ttl time.Duration) *TCPReassembler {
@@ -453,6 +552,7 @@ func NewTCPReassembler(cid uint32, ttl time.Duration) *TCPReassembler {
 		windows:     make(map[uint32]*TCPReassemblerEntry),
 		decoded:     make(map[uint32]*decodedRecord),
 		outputCh:    make(chan []byte, ReassemblerOutputCap),
+		nackCh:      make(chan uint32, 64),
 		clientID:    cid,
 		stopCh:      make(chan struct{}),
 		decodedTTL:  ttl,
@@ -460,11 +560,11 @@ func NewTCPReassembler(cid uint32, ttl time.Duration) *TCPReassembler {
 		lastAdvance: time.Now(),
 	}
 	cleanupInterval := ttl / 4
-	if cleanupInterval > 2*time.Second {
-		cleanupInterval = 2 * time.Second
+	if cleanupInterval > 500*time.Millisecond {
+		cleanupInterval = 500 * time.Millisecond
 	}
-	if cleanupInterval < time.Second {
-		cleanupInterval = time.Second
+	if cleanupInterval < 200*time.Millisecond {
+		cleanupInterval = 200 * time.Millisecond
 	}
 	ar.cleanupTicker = time.NewTicker(cleanupInterval)
 	go ar.cleanupLoop()
@@ -601,19 +701,29 @@ func (ar *TCPReassembler) drainReady() {
 			case <-ar.stopCh:
 				return
 			default:
-				log.Printf("[WARN] reassembler output queue full: expected=%d buffered=%d, closing session", ar.nextExpectedSeq, ar.bufferedBytes)
+				log.Printf("[WARN] reassembler output queue full: expected=%d buffered=%d, closing reassembler", ar.nextExpectedSeq, ar.bufferedBytes)
 				ar.Close()
 				return
 			}
 		} else {
-			log.Printf("[WARN] FEC seq %d still missing, waiting for parity", ar.nextExpectedSeq)
-			break
+			select {
+			case ar.outputCh <- nil:
+			case <-ar.stopCh:
+				return
+			default:
+				log.Printf("[WARN] reassembler gap marker blocked: expected=%d buffered=%d", ar.nextExpectedSeq, ar.bufferedBytes)
+				ar.Close()
+				return
+			}
 		}
 
 		delete(ar.readyBuffer, ar.nextExpectedSeq)
 		ar.bufferedBytes -= len(payload)
 		ar.nextExpectedSeq++
 		ar.lastAdvance = time.Now()
+		ar.gapNackSeq = 0
+		ar.gapNackAttempts = 0
+		ar.lastNack = time.Time{}
 	}
 
 	for s := range ar.readyBuffer {
@@ -631,6 +741,49 @@ func (ar *TCPReassembler) Output() <-chan []byte {
 	return ar.outputCh
 }
 
+func (ar *TCPReassembler) NACK() <-chan uint32 {
+	return ar.nackCh
+}
+
+func (ar *TCPReassembler) failGapLocked(now time.Time) {
+	skipTo := ar.nextExpectedSeq + 1
+	for seq, payload := range ar.readyBuffer {
+		if int32(seq-skipTo) >= 0 {
+			skipTo = seq + 1
+		}
+		if payload != nil {
+			outputPool.Put(payload[:cap(payload)])
+		}
+	}
+	for seq, e := range ar.windows {
+		if int32(seq-skipTo) >= 0 {
+			skipTo = seq + 1
+		}
+		for _, sp := range e.shards {
+			if sp != nil {
+				PutShardPtr(sp)
+			}
+		}
+	}
+	ar.windows = make(map[uint32]*TCPReassemblerEntry)
+	ar.decoded = make(map[uint32]*decodedRecord)
+	ar.readyBuffer = make(map[uint32][]byte)
+	ar.bufferedBytes = 0
+	ar.nextExpectedSeq = skipTo
+	ar.initialized = true
+	ar.gapNackSeq = 0
+	ar.gapNackAttempts = 0
+	ar.lastNack = time.Time{}
+	ar.lastAdvance = now
+	select {
+	case ar.outputCh <- nil:
+	case <-ar.stopCh:
+	default:
+		log.Printf("[WARN] reassembler gap reset marker blocked: expected=%d", ar.nextExpectedSeq)
+		ar.Close()
+	}
+}
+
 func (ar *TCPReassembler) cleanupLoop() {
 	for {
 		select {
@@ -645,11 +798,28 @@ func (ar *TCPReassembler) cleanupLoop() {
 func (ar *TCPReassembler) cleanupStale() {
 	ar.mu.Lock()
 	n := time.Now()
-	if len(ar.readyBuffer) > 0 && n.Sub(ar.lastAdvance) > ReassemblerGapTTL {
-		log.Printf("[WARN] reassembler gap timeout: expected=%d ready=%d buffered=%d", ar.nextExpectedSeq, len(ar.readyBuffer), ar.bufferedBytes)
-		ar.mu.Unlock()
-		ar.Close()
-		return
+	if len(ar.readyBuffer) > 0 && n.Sub(ar.lastAdvance) > NackRetryInterval {
+		seq := ar.nextExpectedSeq
+		if ar.gapNackSeq != seq {
+			ar.gapNackSeq = seq
+			ar.gapNackAttempts = 0
+			ar.lastNack = time.Time{}
+		}
+		if ar.gapNackAttempts < NackMaxAttempts && (ar.lastNack.IsZero() || n.Sub(ar.lastNack) >= NackRetryInterval) {
+			select {
+			case ar.nackCh <- seq:
+			default:
+			}
+			ar.gapNackAttempts++
+			ar.lastNack = n
+			if ar.gapNackAttempts == 2 || ar.gapNackAttempts == NackMaxAttempts {
+				log.Printf("[WARN] reassembler gap seq=%d ready=%d buffered=%d; NACK attempt %d/%d", seq, len(ar.readyBuffer), ar.bufferedBytes, ar.gapNackAttempts, NackMaxAttempts)
+			}
+		}
+		if n.Sub(ar.lastAdvance) > ReassemblerGapTTL && ar.gapNackAttempts >= NackMaxAttempts {
+			log.Printf("[WARN] reassembler gap timeout: expected=%d ready=%d buffered=%d; resetting target data window", ar.nextExpectedSeq, len(ar.readyBuffer), ar.bufferedBytes)
+			ar.failGapLocked(n)
+		}
 	}
 	for k, r := range ar.decoded {
 		if int32(k-ar.nextExpectedSeq) < 0 || n.Sub(r.decodedAt) > ar.decodedTTL {
@@ -812,56 +982,122 @@ func (tm *TargetConnManager) Range(fn func(key uint32, tc *targetConn) bool) {
 	}
 }
 
+type reasmEvent struct {
+	bucket  uint8
+	control bool
+	nack    bool
+	closed  bool
+	seq     uint32
+	data    []byte
+}
+
+func muxBucket(data []byte) uint8 {
+	if DataBuckets <= 1 || len(data) < 5 {
+		return 0
+	}
+	id := binary.BigEndian.Uint32(data[1:5])
+	return uint8(id % DataBuckets)
+}
+
 type Session struct {
-	cid       uint32
-	uid       string
-	currentDS uint8
-	currentPS uint8
-	enc       reedsolomon.Encoder
-	tm        *TargetConnManager
-	pfb       []byte
-	cfb       []byte
-	do        sync.Once
-	fw        atomic.Uint32
-	cfw       atomic.Uint32
-	tr        *TCPReassembler
-	cr        *TCPReassembler
-	la        atomic.Int64
-	ic        atomic.Bool
-	cs        chan struct{}
-	cc        chan struct{}
-	wg        SafeWG
-	fs        chan struct{}
-	sts       atomic.Value
-	sm        sync.Mutex
-	sdm       sync.RWMutex
-	wm        sync.Mutex
-	ut        sync.Map
+	cid             uint32
+	uid             string
+	currentDS       uint8
+	currentPS       uint8
+	enc             reedsolomon.Encoder
+	tm              *TargetConnManager
+	pfbs            [][]byte
+	cfb             []byte
+	do              sync.Once
+	fws             []atomic.Uint32
+	cfw             atomic.Uint32
+	trs             []*TCPReassembler
+	cr              *TCPReassembler
+	la              atomic.Int64
+	ic              atomic.Bool
+	cs              chan struct{}
+	cc              chan struct{}
+	reasmCh         chan reasmEvent
+	wg              SafeWG
+	fs              chan struct{}
+	sts             atomic.Value
+	sm              sync.Mutex
+	sdm             sync.RWMutex
+	wm              sync.Mutex
+	ut              sync.Map
+	rtx             *RetransmitCache
+	nackScore       atomic.Int64
+	lastNackMissLog atomic.Int64
+	lastTraffic     atomic.Int64
+	batchMu         sync.Mutex
+	batchBufs       [][]byte
+	batchActive     []bool
 }
 
 func NewSession(cid uint32, uid string) *Session {
 	s := &Session{
-		cid:       cid,
-		uid:       uid,
-		currentDS: DataShards,
-		currentPS: ParityShards,
-		enc:       getEncoder(DataShards, ParityShards),
-		tm:        NewTargetConnManager(),
-		tr:        NewTCPReassembler(cid, 120*time.Second),
-		cr:        NewTCPReassembler(cid, 120*time.Second),
-		fs:        make(chan struct{}, 256),
-		cs:        make(chan struct{}, MaxConcurrentConns),
-		cc:        make(chan struct{}),
+		cid:         cid,
+		uid:         uid,
+		currentDS:   DataShards,
+		currentPS:   ParityShards,
+		enc:         getEncoder(DataShards, ParityShards),
+		tm:          NewTargetConnManager(),
+		trs:         make([]*TCPReassembler, DataBuckets),
+		pfbs:        make([][]byte, DataBuckets),
+		fws:         make([]atomic.Uint32, DataBuckets),
+		batchBufs:   make([][]byte, DataBuckets),
+		batchActive: make([]bool, DataBuckets),
+		cr:          NewTCPReassembler(cid, 120*time.Second),
+		fs:          make(chan struct{}, 256),
+		cs:          make(chan struct{}, MaxConcurrentConns),
+		cc:          make(chan struct{}),
+		reasmCh:     make(chan reasmEvent, DataBuckets*4+4),
+		rtx:         NewRetransmitCache(RetransmitCacheSeqs),
 	}
 	s.sts.Store(make([]*SafeConn, 0, NumStreams))
 	s.la.Store(time.Now().Unix())
+	s.lastTraffic.Store(time.Now().UnixNano())
+	for i := 0; i < DataBuckets; i++ {
+		s.trs[i] = NewTCPReassembler(cid, 120*time.Second)
+		go s.pumpReassembler(uint8(i), s.trs[i], false)
+	}
+	go s.pumpReassembler(0, s.cr, true)
 	return s
 }
 
+func (s *Session) pumpReassembler(bucket uint8, ar *TCPReassembler, control bool) {
+	for {
+		select {
+		case <-s.cc:
+			return
+		case <-ar.stopCh:
+			select {
+			case s.reasmCh <- reasmEvent{bucket: bucket, control: control, closed: true}:
+			case <-s.cc:
+			}
+			return
+		case d := <-ar.Output():
+			select {
+			case s.reasmCh <- reasmEvent{bucket: bucket, control: control, data: d}:
+			case <-s.cc:
+				return
+			}
+		case seq := <-ar.NACK():
+			if control {
+				continue
+			}
+			select {
+			case s.reasmCh <- reasmEvent{bucket: bucket, nack: true, seq: seq}:
+			case <-s.cc:
+				return
+			}
+		}
+	}
+}
 func (s *Session) Close() {
 	if s.ic.CompareAndSwap(false, true) {
 		close(s.cc)
-		s.wg.closed.Store(true) // 确保立即拒绝新的 Add() 请求
+		s.wg.closed.Store(true) // 纭繚绔嬪嵆鎷掔粷鏂扮殑 Add() 璇锋眰
 		s.sm.Lock()
 		cur := s.sts.Load().([]*SafeConn)
 		for _, st := range cur {
@@ -875,9 +1111,13 @@ func (s *Session) Close() {
 			v.(*net.UDPConn).Close()
 			return true
 		})
-		s.tr.Close()
+		for _, tr := range s.trs {
+			if tr != nil {
+				tr.Close()
+			}
+		}
 		s.cr.Close()
-		// 核心修复 1：彻底移除导致 fdl 永久冻结的 s.wg.Wait() 死锁代码
+		// 鏍稿績淇 1锛氬交搴曠Щ闄ゅ鑷?fdl 姘镐箙鍐荤粨鐨?s.wg.Wait() 姝婚攣浠ｇ爜
 	}
 }
 
@@ -1037,9 +1277,9 @@ func (srv *Server) hs(cn net.Conn) {
 		timeDiff = -timeDiff
 	}
 
-	// 修复：放宽时钟同步限制到120秒，防止软路由时间漂移导致的秒杀拦截
+	// 淇锛氭斁瀹芥椂閽熷悓姝ラ檺鍒跺埌120绉掞紝闃叉杞矾鐢辨椂闂存紓绉诲鑷寸殑绉掓潃鎷︽埅
 	if timeDiff > 120000 {
-		log.Printf("[SRV] 拒绝连接: 客户端时间戳误差过大 (diff=%dms)！请检查并同步客户端设备(如OpenWrt)的时间！", timeDiff)
+		log.Printf("[SRV] 鎷掔粷杩炴帴: 瀹㈡埛绔椂闂存埑璇樊杩囧ぇ (diff=%dms)锛佽妫€鏌ュ苟鍚屾瀹㈡埛绔澶?濡侽penWrt)鐨勬椂闂达紒", timeDiff)
 		cn.Close()
 		return
 	}
@@ -1101,7 +1341,7 @@ func (srv *Server) hs(cn net.Conn) {
 		}
 
 		ds, ps := h.GetFEC()
-		if ds > 0 && ps > 0 && h.Flags&(ControlFrameFlag|FastLaneFlag|PingFlag|PongFlag|AuthFlag) == 0 {
+		if ds > 0 && ps > 0 && h.Flags&(ControlFrameFlag|FastLaneFlag|PingFlag|PongFlag|AuthFlag|NackFlag) == 0 {
 			s.sdm.Lock()
 			if s.currentDS != ds || s.currentPS != ps {
 				s.currentDS = ds
@@ -1126,6 +1366,13 @@ func (srv *Server) hs(cn net.Conn) {
 		}
 		recordTraffic(s.uid, 0, uint64(HeaderSize+tl))
 		s.la.Store(time.Now().Unix())
+		if h.Flags&NackFlag != 0 {
+			if bp != nil {
+				PutShardPtr(bp)
+			}
+			srv.retransmitSeq(s, h.GetBucket()%DataBuckets, h.SeqNo)
+			continue
+		}
 		if h.Flags&PongFlag != 0 {
 			if bp != nil {
 				PutShardPtr(bp)
@@ -1152,11 +1399,76 @@ func (srv *Server) hs(cn net.Conn) {
 			if h.Flags&ControlFrameFlag != 0 {
 				s.cr.AddShard(h.SeqNo, h.ShardIdx, h.ChunkSize, bp, ds, ps)
 			} else {
-				s.tr.AddShard(h.SeqNo, h.ShardIdx, h.ChunkSize, bp, ds, ps)
+				bucket := h.GetBucket() % DataBuckets
+				s.lastTraffic.Store(time.Now().UnixNano())
+				s.trs[bucket].AddShard(h.SeqNo, h.ShardIdx, h.ChunkSize, bp, ds, ps)
 			}
 		}
 	}
 	sc.Close()
+}
+
+func (srv *Server) sendNACK(s *Session, bucket uint8, seq uint32) {
+	sts := s.getStreams()
+	pl := generateSmartPadding(HeaderSize)
+	h := &PacketHeader{Magic: Magic, ClientID: s.cid, SeqNo: seq, Flags: NackFlag, PaddingLen: pl, Timestamp: uint32(time.Now().UnixMilli() & 0xFFFFFFFF)}
+	h.SetBucket(bucket)
+	s.nackScore.Add(1)
+	b := make([]byte, HeaderSize+int(pl))
+	h.EncodeTo(b[:HeaderSize])
+	for _, st := range sts {
+		if st != nil && !st.IsClosed() {
+			if _, err := st.Write(b); err != nil {
+				st.Close()
+			}
+		}
+	}
+}
+
+func (srv *Server) retransmitSeq(s *Session, bucket uint8, seq uint32) {
+	pkts := s.rtx.Get(bucket, seq)
+	if len(pkts) == 0 {
+		if shouldLogEvery(&s.lastNackMissLog, 5*time.Second) {
+			count, oldestBucket, oldest, newestBucket, newest := s.rtx.Stats()
+			log.Printf("[SRV] NACK cache miss cid=%d bucket=%d seq=%d cache_count=%d cache_range=%d:%d..%d:%d", s.cid, bucket, seq, count, oldestBucket, oldest, newestBucket, newest)
+		}
+		return
+	}
+	var streams []*SafeConn
+	for _, st := range s.getStreams() {
+		if st != nil && !st.IsClosed() {
+			streams = append(streams, st)
+		}
+	}
+	if len(streams) == 0 {
+		return
+	}
+	for i, pkt := range pkts {
+		st := streams[i%len(streams)]
+		if _, err := st.Write(pkt); err != nil {
+			st.Close()
+		}
+	}
+	debugf("[SRV] retransmitted cid=%d bucket=%d seq=%d shards=%d", s.cid, bucket, seq, len(pkts))
+}
+
+func (srv *Server) resetTargetConns(s *Session, reason string) {
+	log.Printf("[WARN] resetting active target conns: cid=%d reason=%s", s.cid, reason)
+	var targets []*targetConn
+	s.tm.Range(func(id uint32, tc *targetConn) bool {
+		targets = append(targets, tc)
+		return true
+	})
+	for _, tc := range targets {
+		tc.Close()
+	}
+	s.ut.Range(func(k, v interface{}) bool {
+		if uc, ok := v.(*net.UDPConn); ok {
+			uc.Close()
+		}
+		s.ut.Delete(k)
+		return true
+	})
 }
 
 func (srv *Server) fdl(s *Session) {
@@ -1165,23 +1477,38 @@ func (srv *Server) fdl(s *Session) {
 		if s.ic.CompareAndSwap(false, true) {
 			close(s.cc)
 		}
-		s.Close() // Close all streams + FEC, force RST/FIN to client
+		s.Close()
 	}()
 
 	for {
 		select {
-		case <-s.tr.stopCh:
-			return
-		case <-s.cr.stopCh:
-			return
 		case <-s.cc:
 			return
-		case d := <-s.tr.Output():
-			if !srv.handleClientFrames(s, &s.pfb, d) {
+		case ev := <-s.reasmCh:
+			if ev.closed {
 				return
 			}
-		case d := <-s.cr.Output():
-			if !srv.handleClientFrames(s, &s.cfb, d) {
+			if ev.nack {
+				srv.sendNACK(s, ev.bucket, ev.seq)
+				continue
+			}
+			if ev.control {
+				if ev.data == nil {
+					s.cfb = s.cfb[:0]
+					continue
+				}
+				if !srv.handleClientFrames(s, &s.cfb, ev.data) {
+					return
+				}
+				continue
+			}
+			bucket := int(ev.bucket % DataBuckets)
+			if ev.data == nil {
+				s.pfbs[bucket] = s.pfbs[bucket][:0]
+				srv.resetTargetConns(s, fmt.Sprintf("data bucket %d reassembler gap", bucket))
+				continue
+			}
+			if !srv.handleClientFrames(s, &s.pfbs[bucket], ev.data) {
 				return
 			}
 		}
@@ -1267,7 +1594,7 @@ func (srv *Server) hcWithPreReg(s *Session, tc *targetConn, p []byte) {
 
 	resolvedHost := resolveHostCached(a)
 
-	// 防治客户端透明代理引发的回环攻击 (Routing Loop)
+	// 闃叉不瀹㈡埛绔€忔槑浠ｇ悊寮曞彂鐨勫洖鐜敾鍑?(Routing Loop)
 	configMu.RLock()
 	listenPorts := GlobalConfig.ListenPorts
 	configMu.RUnlock()
@@ -1281,7 +1608,7 @@ func (srv *Server) hcWithPreReg(s *Session, tc *targetConn, p []byte) {
 	}
 
 	if isSelfPort && isLocalIP(resolvedHost) {
-		log.Printf("[SRV] 🛑 拒绝回环拨号: 拦截到客户端发往服务器自身监听端口的死循环请求 -> %s:%d", resolvedHost, pt)
+		log.Printf("[SRV] 馃洃 鎷掔粷鍥炵幆鎷ㄥ彿: 鎷︽埅鍒板鎴风鍙戝線鏈嶅姟鍣ㄨ嚜韬洃鍚鍙ｇ殑姝诲惊鐜姹?-> %s:%d", resolvedHost, pt)
 		s.tm.Remove(tc.id)
 		srv.stc(s, encodeFrame(2, tc.id, nil))
 		return
@@ -1381,7 +1708,7 @@ func (srv *Server) hu(s *Session, id uint32, p []byte) {
 
 	resolvedHost := resolveHostCached(host)
 
-	// 防治 UDP 透明代理回环
+	// 闃叉不 UDP 閫忔槑浠ｇ悊鍥炵幆
 	configMu.RLock()
 	listenPorts := GlobalConfig.ListenPorts
 	configMu.RUnlock()
@@ -1462,11 +1789,62 @@ func (srv *Server) utrl(s *Session, id uint32, uc *net.UDPConn) {
 }
 
 func (srv *Server) stc(s *Session, d []byte) {
-	srv.stcWithMode(s, d, isServerControlFrame(d), false)
+	control := isServerControlFrame(d)
+	if control {
+		srv.flushAllServerBatches(s)
+	}
+	srv.stcWithMode(s, d, control, false)
 }
 
 func (srv *Server) stcFast(s *Session, d []byte) {
-	srv.stcWithMode(s, d, isServerControlFrame(d), true)
+	control := isServerControlFrame(d)
+	if control {
+		srv.flushAllServerBatches(s)
+	}
+	srv.stcWithMode(s, d, control, true)
+}
+
+func (srv *Server) enqueueServerData(s *Session, d []byte) {
+	if s.ic.Load() {
+		return
+	}
+	bucket := muxBucket(d)
+	cp := make([]byte, len(d))
+	copy(cp, d)
+	var flush []byte
+	s.batchMu.Lock()
+	s.batchBufs[bucket] = append(s.batchBufs[bucket], cp...)
+	if len(s.batchBufs[bucket]) >= 4*MSS {
+		flush = s.batchBufs[bucket]
+		s.batchBufs[bucket] = nil
+		s.batchActive[bucket] = false
+	} else if !s.batchActive[bucket] {
+		s.batchActive[bucket] = true
+		go func(b uint8) {
+			time.Sleep(time.Duration(1+fastRand()%3) * time.Millisecond)
+			srv.flushServerBatch(s, b)
+		}(bucket)
+	}
+	s.batchMu.Unlock()
+	if len(flush) > 0 {
+		srv.stcWithMode(s, flush, false, false)
+	}
+}
+
+func (srv *Server) flushAllServerBatches(s *Session) {
+	for i := 0; i < DataBuckets; i++ {
+		srv.flushServerBatch(s, uint8(i))
+	}
+}
+func (srv *Server) flushServerBatch(s *Session, bucket uint8) {
+	s.batchMu.Lock()
+	data := s.batchBufs[bucket]
+	s.batchBufs[bucket] = nil
+	s.batchActive[bucket] = false
+	s.batchMu.Unlock()
+	if len(data) > 0 && !s.ic.Load() {
+		srv.stcWithMode(s, data, false, false)
+	}
 }
 
 func isServerControlFrame(data []byte) bool {
@@ -1479,22 +1857,38 @@ func isServerControlFrame(data []byte) bool {
 	return data[0] == 0x01 || data[0] == 0x02 || data[0] == 0x03
 }
 
-func chooseServerDataFEC(active, curDS, curPS, remaining int) (int, int) {
+func (srv *Server) chooseServerDataFEC(s *Session, active, curDS, curPS, remaining int) (int, int) {
+	score := s.nackScore.Load()
 	if remaining <= SmallPacketFastLen {
-		return 1, 2
+		if score >= 4 || active <= 3 {
+			return 1, 2
+		}
+		return 1, 1
 	}
 	switch {
 	case active >= 6:
-		if curDS <= 1 || curPS <= 0 {
-			return DataShards, ParityShards
+		if score == 0 {
+			return 5, 1
 		}
-		return curDS, curPS
+		if score < 4 {
+			return 4, 2
+		}
+		return 3, 3
 	case active == 5:
-		return 4, 2
-	case active == 4:
+		if score < 3 {
+			return 4, 1
+		}
 		return 3, 2
-	case active == 3:
+	case active == 4:
+		if score < 3 {
+			return 3, 1
+		}
 		return 2, 2
+	case active == 3:
+		if score < 3 {
+			return 2, 1
+		}
+		return 1, 2
 	default:
 		return 1, 2
 	}
@@ -1529,6 +1923,7 @@ func (srv *Server) stcWithMode(s *Session, d []byte, control bool, forceFast boo
 		var ds, ps int
 		var enc reedsolomon.Encoder
 		var sq uint32
+		var bucket uint8
 		var fastLane bool
 		if control || forceFast {
 			ds, ps = 1, 2
@@ -1536,13 +1931,19 @@ func (srv *Server) stcWithMode(s *Session, d []byte, control bool, forceFast boo
 			if control {
 				sq = s.cfw.Add(1) - 1
 			} else {
-				sq = s.fw.Add(1) - 1
+				bucket = muxBucket(d)
+				sq = s.fws[bucket].Add(1) - 1
 				fastLane = true
 			}
 		} else {
+			bucket = muxBucket(d)
+			s.lastTraffic.Store(time.Now().UnixNano())
+			if score := s.nackScore.Load(); score > 0 && fastRand()%64 == 0 {
+				s.nackScore.Store(score * 3 / 4)
+			}
 			s.sdm.RLock()
-			ds, ps = chooseServerDataFEC(len(vs), int(s.currentDS), int(s.currentPS), len(d)-o)
-			sq = s.fw.Add(1) - 1
+			ds, ps = srv.chooseServerDataFEC(s, len(vs), int(s.currentDS), int(s.currentPS), len(d)-o)
+			sq = s.fws[bucket].Add(1) - 1
 			s.sdm.RUnlock()
 			enc = getEncoder(ds, ps)
 			fastLane = ds == 1 && ps >= 2
@@ -1630,6 +2031,7 @@ func (srv *Server) stcWithMode(s *Session, d []byte, control bool, forceFast boo
 					h.Flags |= FastLaneFlag
 				}
 				h.SetFEC(ds, ps)
+				h.SetBucket(bucket)
 				sp := pa[i]
 				h.EncodeTo((*sp)[:HeaderSize])
 				pe := HeaderSize + len(sa[i])
@@ -1637,8 +2039,11 @@ func (srv *Server) stcWithMode(s *Session, d []byte, control bool, forceFast boo
 				for j := pe; j < pe+int(pl); j++ {
 					(*sp)[j] = 0
 				}
+				if !control {
+					s.rtx.Store(bucket, sq, uint16(i), pkt)
+				}
 				if n, err := st.Write(pkt); err != nil {
-					// 仅安全移除问题流，逻辑层绝对隔离不影响业务
+					// 浠呭畨鍏ㄧЩ闄ら棶棰樻祦锛岄€昏緫灞傜粷瀵归殧绂讳笉褰卞搷涓氬姟
 					st.Close()
 					s.sm.Lock()
 					sts := s.getStreams()
@@ -1895,8 +2300,9 @@ func fallbackToCamo(cn net.Conn, p []byte) {
 		return
 	}
 	if m == "self" {
-		fakeHTML := "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n<html><head><title>Welcome to nginx!</title></head><body style=\"font-family: sans-serif; padding: 40px;\"><h1>Welcome to nginx!</h1><p>If you see this page, the nginx web server is successfully installed and working.</p></body></html>"
-		cn.Write([]byte(fakeHTML))
+		body := "<!DOCTYPE html>\n<html>\n<head>\n<title>Welcome to nginx!</title>\n<style>html{color-scheme:light dark}body{width:35em;margin:0 auto;font-family:Tahoma,Verdana,Arial,sans-serif}</style>\n</head>\n<body>\n<h1>Welcome to nginx!</h1>\n<p>If you see this page, the nginx web server is successfully installed and working. Further configuration is required.</p>\n<p><em>Thank you for using nginx.</em></p>\n</body>\n</html>\n"
+		resp := fmt.Sprintf("HTTP/1.1 200 OK\r\nServer: nginx\r\nDate: %s\r\nContent-Type: text/html\r\nContent-Length: %d\r\nLast-Modified: Tue, 18 Jun 2024 12:00:00 GMT\r\nETag: \"66717fc0-%x\"\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n%s", time.Now().UTC().Format(http.TimeFormat), len(body), len(body), body)
+		cn.Write([]byte(resp))
 		cn.Close()
 		return
 	}
@@ -2166,7 +2572,7 @@ func startServerWeb() {
 					t = s.(*TrafficStat).Tx.Load()
 					x = s.(*TrafficStat).Rx.Load()
 				}
-				es := "永久"
+				es := "姘镐箙"
 				if u.ExpireAt > 0 {
 					es = time.Unix(u.ExpireAt, 0).Format("2006-01-02")
 				}
@@ -2305,7 +2711,7 @@ func formatBytes(b uint64) string {
 	return fmt.Sprintf("%.1f %cB", float64(b)/float64(d), "KMGTPE"[e])
 }
 
-const serverHTML = `<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>SuperYellow Proxy Panel</title><script src="https://cdn.tailwindcss.com"></script><script src="https://unpkg.com/vue@3/dist/vue.global.prod.js"></script><style>body{background-color:#f9fafb;color:#111827;font-family:system-ui,-apple-system,sans-serif} .ring{border-radius:50%;display:flex;align-items:center;justify-content:center;box-shadow:inset 0 0 10px rgba(0,0,0,0.05)} .copy-btn{cursor:pointer;padding:4px 12px;border-radius:6px;font-size:12px;font-weight:700;transition:all 0.2s} .copy-btn:hover{transform:scale(1.05)} .toast{position:fixed;top:20px;right:20px;background:#10b981;color:white;padding:12px 24px;border-radius:10px;font-weight:700;z-index:9999;animation:fadeIn 0.3s} @keyframes fadeIn{from{opacity:0;transform:translateY(-10px)}to{opacity:1;transform:translateY(0)}} .modal-overlay{position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.4);display:flex;align-items:center;justify-content:center;z-index:50;backdrop-filter:blur(4px)} .config-box{background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px;padding:12px;font-family:monospace;font-size:12px;white-space:pre-wrap;word-break:break-all;max-height:200px;overflow-y:auto;user-select:text}</style></head><body><div id="app" class="min-h-screen flex"><div v-if="!log" class="m-auto bg-white p-8 rounded-xl shadow-2xl w-96 border border-gray-100"><h2 class="text-2xl font-black mb-8 text-center tracking-tight">SuperYellow<span class="text-yellow-400">/</span><span class="text-gray-400">Admin</span></h2><div class="space-y-4"><input v-model="u" class="w-full p-3 bg-gray-50 border border-gray-200 rounded outline-none focus:border-black transition" placeholder="管理员账号"><input v-model="p" type="password" class="w-full p-3 bg-gray-50 border border-gray-200 rounded outline-none focus:border-black transition" placeholder="管理密码" @keyup.enter="li"><button @click="li" class="w-full bg-black text-white p-3 rounded font-bold hover:bg-gray-800 transition shadow-lg">登录面板</button></div></div><template v-else><div class="w-64 bg-black text-white p-6 flex flex-col shadow-2xl z-10" style="min-width:256px"><div class="text-2xl font-black mb-10 tracking-tighter">SuperYellow<span class="text-yellow-400 text-3xl leading-none">.</span></div><div class="space-y-2 flex-1"><div @click="t='s'" :class="t=='s'?'bg-gray-800 text-white':'text-gray-400 hover:text-white hover:bg-gray-900'" class="p-3 cursor-pointer rounded transition font-medium">系统状态</div><div @click="fu();t='u'" :class="t=='u'?'bg-gray-800 text-white':'text-gray-400 hover:text-white hover:bg-gray-900'" class="p-3 cursor-pointer rounded transition font-medium">客户管理</div><div @click="fc();t='c'" :class="t=='c'?'bg-gray-800 text-white':'text-gray-400 hover:text-white hover:bg-gray-900'" class="p-3 cursor-pointer rounded transition font-medium">节点配置</div></div><div class="text-xs text-gray-600 mt-auto">SuperYellow Proxy v6</div></div><div class="flex-1 p-10 overflow-y-auto" style="width:100%"><div v-if="t=='s'" class="space-y-8"><h2 class="text-3xl font-bold mb-6 tracking-tight">系统状态</h2><div class="bg-white p-8 shadow-sm rounded-2xl border border-gray-100 flex justify-around items-center text-center flex-wrap"><div class="flex flex-col items-center"><div class="w-32 h-32 ring mb-4" style="width:128px;height:128px;background:conic-gradient(#3b82f6 30%, #f3f4f6 0)"><div class="w-28 h-28 bg-white rounded-full flex flex-col items-center justify-center" style="width:112px;height:112px;background-color:white;border-radius:50%;display:flex;flex-direction:column;align-items:center;justify-content:center;"><span class="text-xl font-bold text-gray-800">{{st.cpu}}</span></div></div><div class="text-sm font-bold text-gray-500 tracking-wider">CPU</div></div><div class="flex flex-col items-center"><div class="w-32 h-32 ring mb-4" style="width:128px;height:128px;background:conic-gradient(#10b981 40%, #f3f4f6 0)"><div class="w-28 h-28 bg-white rounded-full flex flex-col items-center justify-center" style="width:112px;height:112px;background-color:white;border-radius:50%;display:flex;flex-direction:column;align-items:center;justify-content:center;"><span class="text-xl font-bold text-gray-800">{{st.mem}}</span></div></div><div class="text-sm font-bold text-gray-500 tracking-wider">内存</div></div><div class="flex flex-col items-center"><div class="w-32 h-32 ring mb-4" style="width:128px;height:128px;background:conic-gradient(#8b5cf6 60%, #f3f4f6 0)"><div class="w-28 h-28 bg-white rounded-full flex flex-col items-center justify-center" style="width:112px;height:112px;background-color:white;border-radius:50%;display:flex;flex-direction:column;align-items:center;justify-content:center;"><span class="text-xl font-bold text-gray-800">{{st.go}}</span></div></div><div class="text-sm font-bold text-gray-500 tracking-wider">协程</div></div></div><div class="grid grid-cols-3 gap-6" style="display:flex;flex-wrap:wrap;gap:1.5rem"><div class="bg-white p-6 shadow-sm rounded-2xl border border-gray-100" style="flex:1;min-width:200px"><div class="text-sm font-bold text-gray-400 mb-1">运行时间</div><div class="text-2xl font-black text-gray-800">{{st.ut}}</div></div><div class="bg-white p-6 shadow-sm rounded-2xl border border-gray-100" style="flex:1;min-width:200px"><div class="text-sm font-bold text-gray-400 mb-1">上行流量</div><div class="text-2xl font-black text-blue-600">{{st.tx}}</div></div><div class="bg-white p-6 shadow-sm rounded-2xl border border-gray-100" style="flex:1;min-width:200px"><div class="text-sm font-bold text-gray-400 mb-1">下行流量</div><div class="text-2xl font-black text-green-600">{{st.rx}}</div></div></div></div><div v-if="t=='u'"><div class="flex justify-between items-center mb-6"><h2 class="text-3xl font-bold tracking-tight">客户管理</h2><div class="flex gap-3"><button @click="rg" class="bg-yellow-400 text-black px-5 py-2 rounded-lg font-bold shadow-lg hover:bg-yellow-300 transition">🎲 随机生成客户</button><button @click="sa=true;isEdit=false;nu={enable:true,LimitGb:0,ExpStr:''}" class="bg-black text-white px-6 py-2 rounded-lg font-bold shadow-lg hover:bg-gray-800 transition">+ 手动添加</button></div></div><div class="bg-white shadow-sm rounded-2xl border border-gray-100 overflow-hidden"><table class="w-full text-left text-sm"><thead class="bg-gray-50 text-gray-500 border-b border-gray-100"><tr><th class="p-4 font-bold">状态</th><th class="p-4 font-bold">用户名</th><th class="p-4 font-bold">密码</th><th class="p-4 font-bold">到期日</th><th class="p-4 font-bold">流量</th><th class="p-4 font-bold">TX / RX</th><th class="p-4 font-bold text-right">操作</th></tr></thead><tbody><tr v-for="u in us" class="border-b border-gray-50 hover:bg-gray-50 transition"><td class="p-4"><span v-if="u.enable" class="px-2 py-1 bg-green-100 text-green-700 rounded text-xs font-bold">活动</span><span v-else class="px-2 py-1 bg-red-100 text-red-700 rounded text-xs font-bold">封禁</span></td><td class="p-4 font-bold text-gray-800">{{u.username}}</td><td class="p-4 font-mono text-gray-500 text-xs">{{u.password}}</td><td class="p-4 text-gray-600">{{u.Exp}}</td><td class="p-4 text-gray-600"><span v-if="u.limit>0">{{(u.limit/1073741824).toFixed(1)}}G</span><span v-else class="text-gray-400">无限</span></td><td class="p-4 font-mono text-gray-500 text-xs">{{u.Tx}} / {{u.Rx}}</td><td class="p-4 text-right"><button @click="cp(u,'vless')" class="copy-btn bg-blue-100 text-blue-700 hover:bg-blue-200 mr-2">📋 VLESS</button><button @click="cp(u,'json')" class="copy-btn bg-purple-100 text-purple-700 hover:bg-purple-200 mr-2">📋 JSON</button><button @click="eu(u)" class="text-blue-500 hover:text-blue-700 font-bold transition mr-3">编辑</button><button @click="du(u.id)" class="text-red-500 hover:text-red-700 font-bold transition">删除</button></td></tr></tbody></table></div></div><div v-if="t=='c'" class="space-y-6 max-w-3xl"><h2 class="text-3xl font-bold tracking-tight mb-6">节点配置</h2><div class="bg-white p-8 shadow-sm rounded-2xl border border-gray-100 space-y-5"><div class="grid grid-cols-2 gap-6" style="display:flex;gap:1.5rem"><div style="flex:1"><label class="block text-sm font-bold text-gray-500 mb-2">面板账号</label><input v-model="cf.panel_user" class="w-full p-3 bg-gray-50 border border-gray-200 rounded outline-none focus:border-black"></div><div style="flex:1"><label class="block text-sm font-bold text-gray-500 mb-2">面板密码</label><input v-model="cf.panel_pass" type="password" class="w-full p-3 bg-gray-50 border border-gray-200 rounded outline-none focus:border-black"></div></div><div><label class="block text-sm font-bold text-gray-500 mb-2">域名 (留空自签证书)</label><input v-model="cf.domain" class="w-full p-3 bg-gray-50 border border-gray-200 rounded outline-none focus:border-black" placeholder="your.domain.com"></div><div class="grid grid-cols-2 gap-6" style="display:flex;gap:1.5rem"><div style="flex:1"><label class="block text-sm font-bold text-gray-500 mb-2">监听端口</label><input v-model="cf.listen_ports" class="w-full p-3 bg-gray-50 border border-gray-200 rounded outline-none focus:border-black"></div><div style="flex:1"><label class="block text-sm font-bold text-gray-500 mb-2">伪装模式</label><select v-model="cf.camo_mode" class="w-full p-3 bg-gray-50 border border-gray-200 rounded outline-none focus:border-black"><option value="proxy">反向代理</option><option value="self">自建欢迎页</option><option value="local">返回400</option></select></div></div><div v-if="cf.camo_mode=='proxy'"><label class="block text-sm font-bold text-gray-500 mb-2">代理目标</label><input v-model="cf.camo_target" class="w-full p-3 bg-gray-50 border border-gray-200 rounded outline-none focus:border-black" placeholder="www.microsoft.com:443"></div><button @click="sc" class="bg-black text-white px-8 py-3 rounded-lg font-bold shadow-lg hover:bg-gray-800 transition w-full mt-4">保存配置</button></div></div></div><div v-if="sa" class="modal-overlay"><div class="bg-white p-8 rounded-2xl w-[420px] shadow-2xl border border-gray-100" style="width:420px"><h3 class="text-2xl font-bold mb-6 tracking-tight">{{isEdit?'编辑客户':'添加客户'}}</h3><div class="space-y-4"><div><label class="block text-sm font-bold text-gray-500 mb-1">用户名</label><input v-model="nu.username" class="w-full p-3 bg-gray-50 border border-gray-200 rounded outline-none focus:border-black"></div><div><label class="block text-sm font-bold text-gray-500 mb-1">密码</label><div class="flex gap-2"><input v-model="nu.password" class="flex-1 p-3 bg-gray-50 border border-gray-200 rounded outline-none focus:border-black font-mono"><button @click="nu.password=gp()" class="px-3 bg-gray-200 rounded hover:bg-gray-300 text-sm font-bold">随机</button></div></div><div><label class="block text-sm font-bold text-gray-500 mb-1">流量配额 (GB，0=无限)</label><input v-model.number="nu.LimitGb" type="number" class="w-full p-3 bg-gray-50 border border-gray-200 rounded outline-none focus:border-black"></div><div><label class="block text-sm font-bold text-gray-500 mb-1">过期时间 (空=永久)</label><input v-model="nu.ExpStr" type="date" class="w-full p-3 bg-gray-50 border border-gray-200 rounded outline-none focus:border-black text-gray-600"></div><div class="flex items-center justify-between mt-4"><span class="font-bold text-gray-700">启用</span><button @click="nu.enable=!nu.enable" :class="nu.enable?'bg-green-500':'bg-gray-300'" class="relative inline-flex h-6 w-11 items-center rounded-full transition-colors" style="width:44px;height:24px;border-radius:12px;border:none;cursor:pointer"><span :class="nu.enable?'translate-x-6':'translate-x-1'" class="inline-block h-4 w-4 transform rounded-full bg-white transition" style="display:inline-block;width:16px;height:16px;background:white;border-radius:50%;transition:transform 0.2s;transform:translateX(nu.enable?24px:4px)"></span></button></div><div class="flex gap-4 mt-8" style="display:flex;gap:1rem"><button @click="au" class="flex-1 bg-black text-white p-3 rounded-lg font-bold shadow hover:bg-gray-800 transition" style="flex:1">确认保存</button><button @click="sa=false" class="flex-1 bg-gray-100 text-gray-600 p-3 rounded-lg font-bold hover:bg-gray-200 transition" style="flex:1;background:#f3f4f6">取消</button></div></div></div></div><div v-if="scv" class="modal-overlay" @click.self="scv=false"><div class="bg-white p-8 rounded-2xl shadow-2xl border border-gray-100" style="width:520px;max-width:90vw"><h3 class="text-xl font-bold mb-4">📋 客户端配置 — {{scu.username}}</h3><div class="space-y-4"><div><div class="flex justify-between items-center mb-1"><span class="text-sm font-bold text-gray-500">VLESS 链接 (App 导入)</span><button @click="doCopy(scvless)" class="copy-btn bg-blue-500 text-white hover:bg-blue-600">复制</button></div><div class="config-box">{{scvless}}</div></div><div><div class="flex justify-between items-center mb-1"><span class="text-sm font-bold text-gray-500">JSON 配置 (软路由导入)</span><button @click="doCopy(scjson)" class="copy-btn bg-purple-500 text-white hover:bg-purple-600">复制</button></div><div class="config-box">{{scjson}}</div></div><button @click="scv=false" class="w-full mt-4 bg-gray-100 text-gray-600 p-3 rounded-lg font-bold hover:bg-gray-200 transition">关闭</button></div></div></div><div v-if="toast" class="toast">{{toast}}</div></template></div><script>Vue.createApp({data(){return{log:false,t:'s',sa:false,isEdit:false,u:'',p:'',st:{cpu:'-',mem:'-',go:'-',ut:'-',tx:'-',rx:'-'},us:[],cf:{},nu:{enable:true,LimitGb:0,ExpStr:''},scv:false,scu:{},scvless:'',scjson:'',toast:''}},methods:{uuidFor(s){let h=[2166136261,2166136261^0x9e3779b9,2166136261^0x85ebca6b,2166136261^0xc2b2ae35];for(let j=0;j<h.length;j++){for(let i=0;i<s.length;i++){h[j]^=s.charCodeAt(i)+j*31;h[j]=Math.imul(h[j],16777619)}}let hex='';for(let k=0;k<h.length;k++){hex+=(h[k]>>>0).toString(16).padStart(8,'0')}hex=hex.slice(0,12)+'4'+hex.slice(13);hex=hex.slice(0,16)+'8'+hex.slice(17);return hex.slice(0,8)+'-'+hex.slice(8,12)+'-'+hex.slice(12,16)+'-'+hex.slice(16,20)+'-'+hex.slice(20,32)},async req(p,m='GET',b){let o={method:m};if(b){o.body=JSON.stringify(b);o.headers={'Content-Type':'application/json'}};try{let r=await fetch('/api/'+p,o);if(r.status===401){this.log=false;throw new Error("401")}return await r.json()}catch(e){throw e}},async li(){try{let r=await this.req('login','POST',{User:this.u,Pass:this.p});if(r&&r.ok){this.log=true;this.fs()}}catch(e){alert('登录失败')}},async fs(){try{let r=await this.req('status');if(r)this.st=r}catch(e){}},async fu(){try{let r=await this.req('users');if(r)this.us=r}catch(e){}},async fc(){try{let r=await this.req('settings');if(r)this.cf=r}catch(e){}},gp(){const c='abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';let r='';for(let i=0;i<16;i++)r+=c[Math.floor(Math.random()*c.length)];return r},async rg(){let nu={username:'user_'+Math.random().toString(36).slice(2,8),password:this.gp(),enable:true,LimitGb:0,expire_at:0};await this.req('users','POST',nu);this.fu();this.showToast('已生成: '+nu.username)},eu(u){this.nu=JSON.parse(JSON.stringify(u));if(u.expire_at>0){this.nu.ExpStr=new Date(u.expire_at*1000).toISOString().split('T')[0]}else{this.nu.ExpStr=''}this.nu.LimitGb=u.limit/1073741824;this.isEdit=true;this.sa=true},async au(){if(!this.nu.username||!this.nu.password){alert('账号密码必填');return}this.nu.limit=this.nu.LimitGb*1073741824;if(this.nu.ExpStr){this.nu.expire_at=new Date(this.nu.ExpStr).getTime()/1000}else{this.nu.expire_at=0}if(this.isEdit){await this.req('users/edit','POST',this.nu)}else{await this.req('users','POST',this.nu)}this.sa=false;this.fu()},async du(id){if(confirm('确定删除?')){await this.req('users/del','POST',{ID:id});this.fu()}},cp(u,type){this.scu=u;let srv=this.cf.domain||location.hostname;let port=this.cf.listen_ports||'8443';let sni=this.cf.domain||'';if(type==='vless'){this.scvless='vless://'+this.uuidFor(u.username+':'+u.password)+'@'+srv+':'+port+'?encryption=none&security='+(sni?'tls':'none')+(sni?'&sni='+sni:'')+'&type=tcp&headerType=none#'+u.username}else{this.scjson=JSON.stringify({enable:true,active_node_id:'n_main',nodes:[{id:'n_main',name:u.username,server:srv+':'+port,username:u.username,password:u.password,sni:sni}]},null,2)}this.scv=true},doCopy(text){navigator.clipboard.writeText(text).then(()=>{this.showToast('已复制到剪贴板')}).catch(()=>{let ta=document.createElement('textarea');ta.value=text;document.body.appendChild(ta);ta.select();document.execCommand('copy');document.body.removeChild(ta);this.showToast('已复制')})},showToast(msg){this.toast=msg;setTimeout(()=>{this.toast=''},2000)},async sc(){await this.req('settings','POST',this.cf);this.showToast('配置已保存')}},mounted(){this.req('status').then(r=>{if(r){this.log=true;this.fs();this.fc();setInterval(()=>{if(this.t=='s')this.fs();if(this.t=='u')this.fu()},3000)}}).catch(e=>{})}}).mount('#app')</script></body></html>
+const serverHTML = `<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>SuperYellow Proxy Panel</title><script src="https://cdn.tailwindcss.com"></script><script src="https://unpkg.com/vue@3/dist/vue.global.prod.js"></script><style>body{background-color:#f9fafb;color:#111827;font-family:system-ui,-apple-system,sans-serif} .ring{border-radius:50%;display:flex;align-items:center;justify-content:center;box-shadow:inset 0 0 10px rgba(0,0,0,0.05)} .copy-btn{cursor:pointer;padding:4px 12px;border-radius:6px;font-size:12px;font-weight:700;transition:all 0.2s} .copy-btn:hover{transform:scale(1.05)} .toast{position:fixed;top:20px;right:20px;background:#10b981;color:white;padding:12px 24px;border-radius:10px;font-weight:700;z-index:9999;animation:fadeIn 0.3s} @keyframes fadeIn{from{opacity:0;transform:translateY(-10px)}to{opacity:1;transform:translateY(0)}} .modal-overlay{position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.4);display:flex;align-items:center;justify-content:center;z-index:50;backdrop-filter:blur(4px)} .config-box{background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px;padding:12px;font-family:monospace;font-size:12px;white-space:pre-wrap;word-break:break-all;max-height:200px;overflow-y:auto;user-select:text}</style></head><body><div id="app" class="min-h-screen flex"><div v-if="!log" class="m-auto bg-white p-8 rounded-xl shadow-2xl w-96 border border-gray-100"><h2 class="text-2xl font-black mb-8 text-center tracking-tight">SuperYellow<span class="text-yellow-400">/</span><span class="text-gray-400">Admin</span></h2><div class="space-y-4"><input v-model="u" class="w-full p-3 bg-gray-50 border border-gray-200 rounded outline-none focus:border-black transition" placeholder="绠＄悊鍛樿处鍙?><input v-model="p" type="password" class="w-full p-3 bg-gray-50 border border-gray-200 rounded outline-none focus:border-black transition" placeholder="绠＄悊瀵嗙爜" @keyup.enter="li"><button @click="li" class="w-full bg-black text-white p-3 rounded font-bold hover:bg-gray-800 transition shadow-lg">鐧诲綍闈㈡澘</button></div></div><template v-else><div class="w-64 bg-black text-white p-6 flex flex-col shadow-2xl z-10" style="min-width:256px"><div class="text-2xl font-black mb-10 tracking-tighter">SuperYellow<span class="text-yellow-400 text-3xl leading-none">.</span></div><div class="space-y-2 flex-1"><div @click="t='s'" :class="t=='s'?'bg-gray-800 text-white':'text-gray-400 hover:text-white hover:bg-gray-900'" class="p-3 cursor-pointer rounded transition font-medium">绯荤粺鐘舵€?/div><div @click="fu();t='u'" :class="t=='u'?'bg-gray-800 text-white':'text-gray-400 hover:text-white hover:bg-gray-900'" class="p-3 cursor-pointer rounded transition font-medium">瀹㈡埛绠＄悊</div><div @click="fc();t='c'" :class="t=='c'?'bg-gray-800 text-white':'text-gray-400 hover:text-white hover:bg-gray-900'" class="p-3 cursor-pointer rounded transition font-medium">鑺傜偣閰嶇疆</div></div><div class="text-xs text-gray-600 mt-auto">SuperYellow Proxy v6</div></div><div class="flex-1 p-10 overflow-y-auto" style="width:100%"><div v-if="t=='s'" class="space-y-8"><h2 class="text-3xl font-bold mb-6 tracking-tight">绯荤粺鐘舵€?/h2><div class="bg-white p-8 shadow-sm rounded-2xl border border-gray-100 flex justify-around items-center text-center flex-wrap"><div class="flex flex-col items-center"><div class="w-32 h-32 ring mb-4" style="width:128px;height:128px;background:conic-gradient(#3b82f6 30%, #f3f4f6 0)"><div class="w-28 h-28 bg-white rounded-full flex flex-col items-center justify-center" style="width:112px;height:112px;background-color:white;border-radius:50%;display:flex;flex-direction:column;align-items:center;justify-content:center;"><span class="text-xl font-bold text-gray-800">{{st.cpu}}</span></div></div><div class="text-sm font-bold text-gray-500 tracking-wider">CPU</div></div><div class="flex flex-col items-center"><div class="w-32 h-32 ring mb-4" style="width:128px;height:128px;background:conic-gradient(#10b981 40%, #f3f4f6 0)"><div class="w-28 h-28 bg-white rounded-full flex flex-col items-center justify-center" style="width:112px;height:112px;background-color:white;border-radius:50%;display:flex;flex-direction:column;align-items:center;justify-content:center;"><span class="text-xl font-bold text-gray-800">{{st.mem}}</span></div></div><div class="text-sm font-bold text-gray-500 tracking-wider">鍐呭瓨</div></div><div class="flex flex-col items-center"><div class="w-32 h-32 ring mb-4" style="width:128px;height:128px;background:conic-gradient(#8b5cf6 60%, #f3f4f6 0)"><div class="w-28 h-28 bg-white rounded-full flex flex-col items-center justify-center" style="width:112px;height:112px;background-color:white;border-radius:50%;display:flex;flex-direction:column;align-items:center;justify-content:center;"><span class="text-xl font-bold text-gray-800">{{st.go}}</span></div></div><div class="text-sm font-bold text-gray-500 tracking-wider">鍗忕▼</div></div></div><div class="grid grid-cols-3 gap-6" style="display:flex;flex-wrap:wrap;gap:1.5rem"><div class="bg-white p-6 shadow-sm rounded-2xl border border-gray-100" style="flex:1;min-width:200px"><div class="text-sm font-bold text-gray-400 mb-1">杩愯鏃堕棿</div><div class="text-2xl font-black text-gray-800">{{st.ut}}</div></div><div class="bg-white p-6 shadow-sm rounded-2xl border border-gray-100" style="flex:1;min-width:200px"><div class="text-sm font-bold text-gray-400 mb-1">涓婅娴侀噺</div><div class="text-2xl font-black text-blue-600">{{st.tx}}</div></div><div class="bg-white p-6 shadow-sm rounded-2xl border border-gray-100" style="flex:1;min-width:200px"><div class="text-sm font-bold text-gray-400 mb-1">涓嬭娴侀噺</div><div class="text-2xl font-black text-green-600">{{st.rx}}</div></div></div></div><div v-if="t=='u'"><div class="flex justify-between items-center mb-6"><h2 class="text-3xl font-bold tracking-tight">瀹㈡埛绠＄悊</h2><div class="flex gap-3"><button @click="rg" class="bg-yellow-400 text-black px-5 py-2 rounded-lg font-bold shadow-lg hover:bg-yellow-300 transition">馃幉 闅忔満鐢熸垚瀹㈡埛</button><button @click="sa=true;isEdit=false;nu={enable:true,LimitGb:0,ExpStr:''}" class="bg-black text-white px-6 py-2 rounded-lg font-bold shadow-lg hover:bg-gray-800 transition">+ 鎵嬪姩娣诲姞</button></div></div><div class="bg-white shadow-sm rounded-2xl border border-gray-100 overflow-hidden"><table class="w-full text-left text-sm"><thead class="bg-gray-50 text-gray-500 border-b border-gray-100"><tr><th class="p-4 font-bold">鐘舵€?/th><th class="p-4 font-bold">鐢ㄦ埛鍚?/th><th class="p-4 font-bold">瀵嗙爜</th><th class="p-4 font-bold">鍒版湡鏃?/th><th class="p-4 font-bold">娴侀噺</th><th class="p-4 font-bold">TX / RX</th><th class="p-4 font-bold text-right">鎿嶄綔</th></tr></thead><tbody><tr v-for="u in us" class="border-b border-gray-50 hover:bg-gray-50 transition"><td class="p-4"><span v-if="u.enable" class="px-2 py-1 bg-green-100 text-green-700 rounded text-xs font-bold">娲诲姩</span><span v-else class="px-2 py-1 bg-red-100 text-red-700 rounded text-xs font-bold">灏佺</span></td><td class="p-4 font-bold text-gray-800">{{u.username}}</td><td class="p-4 font-mono text-gray-500 text-xs">{{u.password}}</td><td class="p-4 text-gray-600">{{u.Exp}}</td><td class="p-4 text-gray-600"><span v-if="u.limit>0">{{(u.limit/1073741824).toFixed(1)}}G</span><span v-else class="text-gray-400">鏃犻檺</span></td><td class="p-4 font-mono text-gray-500 text-xs">{{u.Tx}} / {{u.Rx}}</td><td class="p-4 text-right"><button @click="cp(u,'vless')" class="copy-btn bg-blue-100 text-blue-700 hover:bg-blue-200 mr-2">馃搵 VLESS</button><button @click="cp(u,'json')" class="copy-btn bg-purple-100 text-purple-700 hover:bg-purple-200 mr-2">馃搵 JSON</button><button @click="eu(u)" class="text-blue-500 hover:text-blue-700 font-bold transition mr-3">缂栬緫</button><button @click="du(u.id)" class="text-red-500 hover:text-red-700 font-bold transition">鍒犻櫎</button></td></tr></tbody></table></div></div><div v-if="t=='c'" class="space-y-6 max-w-3xl"><h2 class="text-3xl font-bold tracking-tight mb-6">鑺傜偣閰嶇疆</h2><div class="bg-white p-8 shadow-sm rounded-2xl border border-gray-100 space-y-5"><div class="grid grid-cols-2 gap-6" style="display:flex;gap:1.5rem"><div style="flex:1"><label class="block text-sm font-bold text-gray-500 mb-2">闈㈡澘璐﹀彿</label><input v-model="cf.panel_user" class="w-full p-3 bg-gray-50 border border-gray-200 rounded outline-none focus:border-black"></div><div style="flex:1"><label class="block text-sm font-bold text-gray-500 mb-2">闈㈡澘瀵嗙爜</label><input v-model="cf.panel_pass" type="password" class="w-full p-3 bg-gray-50 border border-gray-200 rounded outline-none focus:border-black"></div></div><div><label class="block text-sm font-bold text-gray-500 mb-2">鍩熷悕 (鐣欑┖鑷璇佷功)</label><input v-model="cf.domain" class="w-full p-3 bg-gray-50 border border-gray-200 rounded outline-none focus:border-black" placeholder="your.domain.com"></div><div class="grid grid-cols-2 gap-6" style="display:flex;gap:1.5rem"><div style="flex:1"><label class="block text-sm font-bold text-gray-500 mb-2">鐩戝惉绔彛</label><input v-model="cf.listen_ports" class="w-full p-3 bg-gray-50 border border-gray-200 rounded outline-none focus:border-black"></div><div style="flex:1"><label class="block text-sm font-bold text-gray-500 mb-2">浼妯″紡</label><select v-model="cf.camo_mode" class="w-full p-3 bg-gray-50 border border-gray-200 rounded outline-none focus:border-black"><option value="proxy">鍙嶅悜浠ｇ悊</option><option value="self">鑷缓娆㈣繋椤?/option><option value="local">杩斿洖400</option></select></div></div><div v-if="cf.camo_mode=='proxy'"><label class="block text-sm font-bold text-gray-500 mb-2">浠ｇ悊鐩爣</label><input v-model="cf.camo_target" class="w-full p-3 bg-gray-50 border border-gray-200 rounded outline-none focus:border-black" placeholder="www.microsoft.com:443"></div><button @click="sc" class="bg-black text-white px-8 py-3 rounded-lg font-bold shadow-lg hover:bg-gray-800 transition w-full mt-4">淇濆瓨閰嶇疆</button></div></div></div><div v-if="sa" class="modal-overlay"><div class="bg-white p-8 rounded-2xl w-[420px] shadow-2xl border border-gray-100" style="width:420px"><h3 class="text-2xl font-bold mb-6 tracking-tight">{{isEdit?'缂栬緫瀹㈡埛':'娣诲姞瀹㈡埛'}}</h3><div class="space-y-4"><div><label class="block text-sm font-bold text-gray-500 mb-1">鐢ㄦ埛鍚?/label><input v-model="nu.username" class="w-full p-3 bg-gray-50 border border-gray-200 rounded outline-none focus:border-black"></div><div><label class="block text-sm font-bold text-gray-500 mb-1">瀵嗙爜</label><div class="flex gap-2"><input v-model="nu.password" class="flex-1 p-3 bg-gray-50 border border-gray-200 rounded outline-none focus:border-black font-mono"><button @click="nu.password=gp()" class="px-3 bg-gray-200 rounded hover:bg-gray-300 text-sm font-bold">闅忔満</button></div></div><div><label class="block text-sm font-bold text-gray-500 mb-1">娴侀噺閰嶉 (GB锛?=鏃犻檺)</label><input v-model.number="nu.LimitGb" type="number" class="w-full p-3 bg-gray-50 border border-gray-200 rounded outline-none focus:border-black"></div><div><label class="block text-sm font-bold text-gray-500 mb-1">杩囨湡鏃堕棿 (绌?姘镐箙)</label><input v-model="nu.ExpStr" type="date" class="w-full p-3 bg-gray-50 border border-gray-200 rounded outline-none focus:border-black text-gray-600"></div><div class="flex items-center justify-between mt-4"><span class="font-bold text-gray-700">鍚敤</span><button @click="nu.enable=!nu.enable" :class="nu.enable?'bg-green-500':'bg-gray-300'" class="relative inline-flex h-6 w-11 items-center rounded-full transition-colors" style="width:44px;height:24px;border-radius:12px;border:none;cursor:pointer"><span :class="nu.enable?'translate-x-6':'translate-x-1'" class="inline-block h-4 w-4 transform rounded-full bg-white transition" style="display:inline-block;width:16px;height:16px;background:white;border-radius:50%;transition:transform 0.2s;transform:translateX(nu.enable?24px:4px)"></span></button></div><div class="flex gap-4 mt-8" style="display:flex;gap:1rem"><button @click="au" class="flex-1 bg-black text-white p-3 rounded-lg font-bold shadow hover:bg-gray-800 transition" style="flex:1">纭淇濆瓨</button><button @click="sa=false" class="flex-1 bg-gray-100 text-gray-600 p-3 rounded-lg font-bold hover:bg-gray-200 transition" style="flex:1;background:#f3f4f6">鍙栨秷</button></div></div></div></div><div v-if="scv" class="modal-overlay" @click.self="scv=false"><div class="bg-white p-8 rounded-2xl shadow-2xl border border-gray-100" style="width:520px;max-width:90vw"><h3 class="text-xl font-bold mb-4">馃搵 瀹㈡埛绔厤缃?鈥?{{scu.username}}</h3><div class="space-y-4"><div><div class="flex justify-between items-center mb-1"><span class="text-sm font-bold text-gray-500">VLESS 閾炬帴 (App 瀵煎叆)</span><button @click="doCopy(scvless)" class="copy-btn bg-blue-500 text-white hover:bg-blue-600">澶嶅埗</button></div><div class="config-box">{{scvless}}</div></div><div><div class="flex justify-between items-center mb-1"><span class="text-sm font-bold text-gray-500">JSON 閰嶇疆 (杞矾鐢卞鍏?</span><button @click="doCopy(scjson)" class="copy-btn bg-purple-500 text-white hover:bg-purple-600">澶嶅埗</button></div><div class="config-box">{{scjson}}</div></div><button @click="scv=false" class="w-full mt-4 bg-gray-100 text-gray-600 p-3 rounded-lg font-bold hover:bg-gray-200 transition">鍏抽棴</button></div></div></div><div v-if="toast" class="toast">{{toast}}</div></template></div><script>Vue.createApp({data(){return{log:false,t:'s',sa:false,isEdit:false,u:'',p:'',st:{cpu:'-',mem:'-',go:'-',ut:'-',tx:'-',rx:'-'},us:[],cf:{},nu:{enable:true,LimitGb:0,ExpStr:''},scv:false,scu:{},scvless:'',scjson:'',toast:''}},methods:{uuidFor(s){let h=[2166136261,2166136261^0x9e3779b9,2166136261^0x85ebca6b,2166136261^0xc2b2ae35];for(let j=0;j<h.length;j++){for(let i=0;i<s.length;i++){h[j]^=s.charCodeAt(i)+j*31;h[j]=Math.imul(h[j],16777619)}}let hex='';for(let k=0;k<h.length;k++){hex+=(h[k]>>>0).toString(16).padStart(8,'0')}hex=hex.slice(0,12)+'4'+hex.slice(13);hex=hex.slice(0,16)+'8'+hex.slice(17);return hex.slice(0,8)+'-'+hex.slice(8,12)+'-'+hex.slice(12,16)+'-'+hex.slice(16,20)+'-'+hex.slice(20,32)},async req(p,m='GET',b){let o={method:m};if(b){o.body=JSON.stringify(b);o.headers={'Content-Type':'application/json'}};try{let r=await fetch('/api/'+p,o);if(r.status===401){this.log=false;throw new Error("401")}return await r.json()}catch(e){throw e}},async li(){try{let r=await this.req('login','POST',{User:this.u,Pass:this.p});if(r&&r.ok){this.log=true;this.fs()}}catch(e){alert('鐧诲綍澶辫触')}},async fs(){try{let r=await this.req('status');if(r)this.st=r}catch(e){}},async fu(){try{let r=await this.req('users');if(r)this.us=r}catch(e){}},async fc(){try{let r=await this.req('settings');if(r)this.cf=r}catch(e){}},gp(){const c='abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';let r='';for(let i=0;i<16;i++)r+=c[Math.floor(Math.random()*c.length)];return r},async rg(){let nu={username:'user_'+Math.random().toString(36).slice(2,8),password:this.gp(),enable:true,LimitGb:0,expire_at:0};await this.req('users','POST',nu);this.fu();this.showToast('宸茬敓鎴? '+nu.username)},eu(u){this.nu=JSON.parse(JSON.stringify(u));if(u.expire_at>0){this.nu.ExpStr=new Date(u.expire_at*1000).toISOString().split('T')[0]}else{this.nu.ExpStr=''}this.nu.LimitGb=u.limit/1073741824;this.isEdit=true;this.sa=true},async au(){if(!this.nu.username||!this.nu.password){alert('璐﹀彿瀵嗙爜蹇呭～');return}this.nu.limit=this.nu.LimitGb*1073741824;if(this.nu.ExpStr){this.nu.expire_at=new Date(this.nu.ExpStr).getTime()/1000}else{this.nu.expire_at=0}if(this.isEdit){await this.req('users/edit','POST',this.nu)}else{await this.req('users','POST',this.nu)}this.sa=false;this.fu()},async du(id){if(confirm('纭畾鍒犻櫎?')){await this.req('users/del','POST',{ID:id});this.fu()}},cp(u,type){this.scu=u;let srv=this.cf.domain||location.hostname;let port=this.cf.listen_ports||'8443';let sni=this.cf.domain||'';if(type==='vless'){this.scvless='vless://'+this.uuidFor(u.username+':'+u.password)+'@'+srv+':'+port+'?encryption=none&security='+(sni?'tls':'none')+(sni?'&sni='+sni:'')+'&type=tcp&headerType=none#'+u.username}else{this.scjson=JSON.stringify({enable:true,active_node_id:'n_main',nodes:[{id:'n_main',name:u.username,server:srv+':'+port,username:u.username,password:u.password,sni:sni}]},null,2)}this.scv=true},doCopy(text){navigator.clipboard.writeText(text).then(()=>{this.showToast('宸插鍒跺埌鍓创鏉?)}).catch(()=>{let ta=document.createElement('textarea');ta.value=text;document.body.appendChild(ta);ta.select();document.execCommand('copy');document.body.removeChild(ta);this.showToast('宸插鍒?)})},showToast(msg){this.toast=msg;setTimeout(()=>{this.toast=''},2000)},async sc(){await this.req('settings','POST',this.cf);this.showToast('閰嶇疆宸蹭繚瀛?)}},mounted(){this.req('status').then(r=>{if(r){this.log=true;this.fs();this.fc();setInterval(()=>{if(this.t=='s')this.fs();if(this.t=='u')this.fu()},3000)}}).catch(e=>{})}}).mount('#app')</script></body></html>
 `
 
 func generateSelfSignedCertificate() (tls.Certificate, error) {
