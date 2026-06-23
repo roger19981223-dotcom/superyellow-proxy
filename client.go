@@ -56,9 +56,9 @@ const (
 	MaxReassemblerBuf    = 64 << 20
 	ReassemblerOutputCap = 2048
 	SmallPacketFastLen   = 1200
-	ReassemblerGapTTL    = 4 * time.Second
-	NackRetryInterval    = 700 * time.Millisecond
-	NackMaxAttempts      = 4
+	ReassemblerGapTTL    = 10 * time.Second
+	NackRetryInterval    = 1500 * time.Millisecond
+	NackMaxAttempts      = 3
 	RetransmitCacheSeqs  = 8192
 	TunnelWriteTimeout   = 5 * time.Second
 	LocalWriteTimeout    = 5 * time.Second
@@ -694,6 +694,9 @@ func (ar *TCPReassembler) cleanupStale() {
 		if n.Sub(ar.lastAdvance) > ReassemblerGapTTL && ar.gapNackAttempts >= NackMaxAttempts {
 			log.Printf("[WARN] reassembler gap timeout: expected=%d ready=%d buffered=%d; resetting data window", ar.nextExpectedSeq, len(ar.readyBuffer), ar.bufferedBytes)
 			ar.failGapLocked(n)
+			} else if len(ar.readyBuffer) > 200 {
+				log.Printf("[WARN] reassembler buffer overflow: expected=%d ready=%d buffered=%d; force resetting", ar.nextExpectedSeq, len(ar.readyBuffer), ar.bufferedBytes)
+				ar.failGapLocked(n)
 		}
 	}
 	for k, r := range ar.decoded {
@@ -945,11 +948,8 @@ func (c *AdaptiveDispatcher) pumpReassembler(bucket uint8, ar *TCPReassembler, c
 			if control {
 				continue
 			}
-			select {
-			case c.reasmCh <- reasmEvent{bucket: bucket, nack: true, seq: seq}:
-			case <-c.stopCh:
-				return
-			}
+			// v5fix: handle NACK inline per-bucket to avoid blocking other buckets
+			c.sendNACK(bucket, seq)
 		}
 	}
 }
@@ -1384,13 +1384,15 @@ func (c *AdaptiveDispatcher) sendFinFrame(connID uint32) {
 }
 
 func (c *AdaptiveDispatcher) sendCloseFrame(connID uint32) {
-	fb := framePool.Get().([]byte)
-	fb = fb[:7]
-	fb[0] = 0x03
-	binary.BigEndian.PutUint32(fb[1:5], connID)
-	binary.BigEndian.PutUint16(fb[5:7], 0)
-	c.SendChunk(fb)
-	framePool.Put(fb[:cap(fb)])
+	go func() {
+		fb := framePool.Get().([]byte)
+		fb = fb[:7]
+		fb[0] = 0x03
+		binary.BigEndian.PutUint32(fb[1:5], connID)
+		binary.BigEndian.PutUint16(fb[5:7], 0)
+		c.SendChunk(fb)
+		framePool.Put(fb[:cap(fb)])
+	}()
 }
 
 func (c *AdaptiveDispatcher) writeSOCKS5UDP(pc *ProxyConn, payload []byte) {
@@ -1419,13 +1421,17 @@ func (c *AdaptiveDispatcher) sendNACK(bucket uint8, seq uint32) {
 	h := &PacketHeader{Magic: Magic, ClientID: c.clientID, SeqNo: seq, Flags: NackFlag, PaddingLen: pl, Timestamp: uint32(time.Now().UnixMilli() & 0xFFFFFFFF)}
 	h.SetBucket(bucket)
 	c.nackScore.Add(1)
-	b := make([]byte, HeaderSize+int(pl))
-	h.EncodeTo(b[:HeaderSize])
+	// v5fix: fire-and-forget NACK to all streams (no blocking)
 	for _, st := range streams {
 		if st != nil && !st.IsClosed() {
-			if _, err := st.Write(b); err != nil {
-				st.Close()
-			}
+			// each stream gets its own buffer copy to avoid data races
+			buf := make([]byte, HeaderSize+int(pl))
+			h.EncodeTo(buf[:HeaderSize])
+			go func(s *SafeStream, b []byte) {
+				if _, err := s.Write(b); err != nil {
+					s.Close()
+				}
+			}(st, buf)
 		}
 	}
 }
@@ -1479,10 +1485,6 @@ func (c *AdaptiveDispatcher) handleReassembler() {
 			if ev.closed {
 				c.reboot()
 				return
-			}
-			if ev.nack {
-				c.sendNACK(ev.bucket, ev.seq)
-				continue
 			}
 			if ev.control {
 				if ev.data == nil {

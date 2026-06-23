@@ -35,8 +35,8 @@ import (
 const (
 	NumStreams       = 6
 	DataBuckets      = 8
-	DataShards       = 5
-	ParityShards     = 1
+	DataShards       = 3
+	ParityShards     = 3
 	MSS              = 1350
 	HeaderSize       = 30
 	Magic            = 0x41455448
@@ -62,9 +62,9 @@ const (
 	MaxReassemblerBuf    = 64 << 20
 	ReassemblerOutputCap = 2048
 	SmallPacketFastLen   = 1200
-	ReassemblerGapTTL    = 4 * time.Second
-	NackRetryInterval    = 700 * time.Millisecond
-	NackMaxAttempts      = 4
+	ReassemblerGapTTL    = 10 * time.Second
+	NackRetryInterval    = 1500 * time.Millisecond
+	NackMaxAttempts      = 3
 	RetransmitCacheSeqs  = 8192
 	TunnelWriteTimeout   = 5 * time.Second
 	TargetConnIdleTTL    = 5 * time.Minute
@@ -819,6 +819,9 @@ func (ar *TCPReassembler) cleanupStale() {
 		if n.Sub(ar.lastAdvance) > ReassemblerGapTTL && ar.gapNackAttempts >= NackMaxAttempts {
 			log.Printf("[WARN] reassembler gap timeout: expected=%d ready=%d buffered=%d; resetting target data window", ar.nextExpectedSeq, len(ar.readyBuffer), ar.bufferedBytes)
 			ar.failGapLocked(n)
+			} else if len(ar.readyBuffer) > 200 {
+				log.Printf("[WARN] reassembler buffer overflow: expected=%d ready=%d buffered=%d; force resetting", ar.nextExpectedSeq, len(ar.readyBuffer), ar.bufferedBytes)
+				ar.failGapLocked(n)
 		}
 	}
 	for k, r := range ar.decoded {
@@ -1030,6 +1033,7 @@ type Session struct {
 	lastNackMissLog atomic.Int64
 	lastTraffic     atomic.Int64
 	batchMu         sync.Mutex
+	srv             *Server
 	batchBufs       [][]byte
 	batchActive     []bool
 }
@@ -1086,11 +1090,8 @@ func (s *Session) pumpReassembler(bucket uint8, ar *TCPReassembler, control bool
 			if control {
 				continue
 			}
-			select {
-			case s.reasmCh <- reasmEvent{bucket: bucket, nack: true, seq: seq}:
-			case <-s.cc:
-				return
-			}
+			// v5fix: handle NACK inline per-bucket
+			s.srv.sendNACK(s, bucket, seq)
 		}
 	}
 }
@@ -1193,6 +1194,7 @@ func (srv *Server) GetOrCreate(cid uint32, uid string) *Session {
 
 	// Create session OUTSIDE global lock
 	s := NewSession(cid, uid)
+	s.srv = srv
 
 	srv.mu.Lock()
 	// Double-check: another goroutine may have created this session
@@ -1414,13 +1416,16 @@ func (srv *Server) sendNACK(s *Session, bucket uint8, seq uint32) {
 	h := &PacketHeader{Magic: Magic, ClientID: s.cid, SeqNo: seq, Flags: NackFlag, PaddingLen: pl, Timestamp: uint32(time.Now().UnixMilli() & 0xFFFFFFFF)}
 	h.SetBucket(bucket)
 	s.nackScore.Add(1)
-	b := make([]byte, HeaderSize+int(pl))
-	h.EncodeTo(b[:HeaderSize])
+	// v5fix: fire-and-forget NACK to all streams (no blocking)
 	for _, st := range sts {
 		if st != nil && !st.IsClosed() {
-			if _, err := st.Write(b); err != nil {
-				st.Close()
-			}
+			buf := make([]byte, HeaderSize+int(pl))
+			h.EncodeTo(buf[:HeaderSize])
+			go func(s *SafeConn, b []byte) {
+				if _, err := s.Write(b); err != nil {
+					s.Close()
+				}
+			}(st, buf)
 		}
 	}
 }
@@ -1487,10 +1492,6 @@ func (srv *Server) fdl(s *Session) {
 		case ev := <-s.reasmCh:
 			if ev.closed {
 				return
-			}
-			if ev.nack {
-				srv.sendNACK(s, ev.bucket, ev.seq)
-				continue
 			}
 			if ev.control {
 				if ev.data == nil {
@@ -1854,7 +1855,7 @@ func isServerControlFrame(data []byte) bool {
 	if len(data) != 7+int(binary.BigEndian.Uint16(data[5:7])) {
 		return false
 	}
-	return data[0] == 0x01 || data[0] == 0x02 || data[0] == 0x03
+	return data[0] == 0x01 || data[0] == 0x03
 }
 
 func (srv *Server) chooseServerDataFEC(s *Session, active, curDS, curPS, remaining int) (int, int) {
