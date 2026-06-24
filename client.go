@@ -1809,9 +1809,11 @@ func (c *AdaptiveDispatcher) sendChunk(data []byte, control bool) bool {
 
 	pkt := buf
 
-	// Target streams: control=all, data=primary(connID%4) only — mirrors cause data duplication!
+	// v7.4: CONNECT (cmd=0x01) sent to ONE stream only to avoid server dedup killing the connection.
+	// Other control frames (CLOSE, FIN) still broadcast to all streams for reliability.
 	var targets []*SafeStream
-	if control {
+	isConnect := len(data) > 0 && data[0] == 0x01
+	if control && !isConnect {
 		targets = active
 	} else {
 		var connID uint32
@@ -2256,6 +2258,20 @@ func (c *AdaptiveDispatcher) DialProxyTarget(conn net.Conn, addr string, targetP
 		log.Printf("[CLI] CONNECT sent connID=%d addr=%s:%d", pc.connID, addr, targetPort)
 		pc.touch()
 		framePool.Put(fb[:cap(fb)])
+
+		// v7.5: wait for server CONNECT ACK before replying to browser
+		select {
+		case <-pc.connectAckCh:
+			debugf("[CLI] CONNECT ACK connID=%d", pc.connID)
+		case <-pc.connectErrCh:
+			log.Printf("[CLI] CONNECT rejected by server connID=%d", pc.connID)
+			conn.Write(socks5Reply(0x05, nil, 0))
+			return
+		case <-time.After(5 * time.Second):
+			log.Printf("[CLI] CONNECT timeout connID=%d", pc.connID)
+			conn.Write(socks5Reply(0x04, nil, 0))
+			return
+		}
 
 		if writeOK != nil && !writeOK() {
 			return

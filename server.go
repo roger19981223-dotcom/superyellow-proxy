@@ -1585,7 +1585,7 @@ func (srv *Server) handleClientFrames(s *Session, pfb *[]byte, d []byte) bool {
 			tc := &targetConn{conn: nil, id: f.ConnID, d: make(chan struct{}), wc: wc, tm: s.tm}
 			tc.touch()
 			if s.tm.Add(f.ConnID, tc) != nil {
-				srv.stc(s, encodeFrame(2, f.ConnID, nil))
+				// v7.4: silently drop duplicate CONNECT (don't send cmd=2 which kills the connection)
 				break
 			}
 			select {
