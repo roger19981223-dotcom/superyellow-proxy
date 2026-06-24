@@ -912,7 +912,7 @@ func NewAdaptiveDispatcher(n NodeConfig) *AdaptiveDispatcher {
 		batchActive: make([]bool, DataBuckets),
 		cr:          NewTCPReassembler(cid, 30*time.Second),
 		stopCh:      make(chan struct{}),
-		reasmCh:     make(chan reasmEvent, DataBuckets*16+16),
+		reasmCh:     make(chan reasmEvent, DataBuckets*4+4),
 		pacing:      NewTokenBucket(1<<30, 64<<20), // 濞戞挸绉村﹢顏呮償閺冨倹鏆忛悘鐐插€垮娲焻閻曞倻绀夐悹浣叉櫅缁ㄥ磭浠?TCP/BBRv3 闁煎浜滅换渚€寮ㄩ懜鍨異
 		currentDS:   1,
 		currentPS:   0,
@@ -926,9 +926,7 @@ func NewAdaptiveDispatcher(n NodeConfig) *AdaptiveDispatcher {
 	go ad.pumpReassembler(0, ad.cr, true)
 	go ad.prewarmStreams()
 	go ad.monitorHealth()
-	for i := 0; i < 6; i++ {
-		go ad.handleReassembler()
-	}
+	go ad.handleReassembler()
 	go ad.cleanupProxyConns()
 	return ad
 }
@@ -2258,21 +2256,6 @@ func (c *AdaptiveDispatcher) DialProxyTarget(conn net.Conn, addr string, targetP
 		log.Printf("[CLI] CONNECT sent connID=%d addr=%s:%d", pc.connID, addr, targetPort)
 		pc.touch()
 		framePool.Put(fb[:cap(fb)])
-
-		// v7.3: Wait for server CONNECT response before sending SOCKS5 reply
-		select {
-		case <-pc.connectAckCh:
-			// Server confirmed target connection established
-		case <-pc.connectErrCh:
-			// Server rejected the CONNECT
-			return
-		case <-time.After(DialTimeout):
-			// Server didn't respond in time
-			log.Printf("[CLI] CONNECT timeout connID=%d addr=%s:%d", pc.connID, addr, targetPort)
-			return
-		case <-pc.done:
-			return
-		}
 
 		if writeOK != nil && !writeOK() {
 			return
