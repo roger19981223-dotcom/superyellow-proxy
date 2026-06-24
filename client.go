@@ -926,10 +926,9 @@ func NewAdaptiveDispatcher(n NodeConfig) *AdaptiveDispatcher {
 	go ad.pumpReassembler(0, ad.cr, true)
 	go ad.prewarmStreams()
 	go ad.monitorHealth()
-	go ad.handleReassembler()
-	go ad.handleReassembler()
-	go ad.handleReassembler()
-	go ad.handleReassembler()
+	for i := 0; i < 6; i++ {
+		go ad.handleReassembler()
+	}
 	go ad.cleanupProxyConns()
 	return ad
 }
