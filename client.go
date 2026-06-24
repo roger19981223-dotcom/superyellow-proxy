@@ -1351,6 +1351,18 @@ func (c *AdaptiveDispatcher) monitorHealth() {
 				}(i)
 			}
 			wg.Wait()
+			{
+				var ac, cc int
+				c.sMu.RLock()
+				for _, st := range c.streams {
+					if st == nil { continue }
+					if st.IsClosed() { cc++ } else { ac++ }
+				}
+				c.sMu.RUnlock()
+				var n int
+				c.conns.Range(func(_, _ any) bool { n++; return true })
+				log.Printf("[CLI] streams=%d/%d conns=%d", ac, ac+cc, n)
+			}
 			if score := c.nackScore.Load(); score > 0 {
 				c.nackScore.Store(score * 3 / 4)
 			}
@@ -1806,7 +1818,7 @@ func (c *AdaptiveDispatcher) sendChunk(data []byte, control bool) bool {
 		if len(data) >= 5 {
 			connID = binary.BigEndian.Uint32(data[1:5])
 		}
-		pIdx := int(connID % 4)
+		pIdx := int(connID % 6)
 		c.sMu.RLock()
 		if pIdx < len(c.streams) && c.streams[pIdx] != nil && !c.streams[pIdx].IsClosed() {
 			targets = append(targets, c.streams[pIdx])

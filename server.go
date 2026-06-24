@@ -1016,6 +1016,7 @@ func muxBucket(data []byte) uint8 {
 type Session struct {
 	cid             uint32
 	uid             string
+	frameCnt        atomic.Int64
 	currentDS       uint8
 	currentPS       uint8
 	enc             reedsolomon.Encoder
@@ -1328,6 +1329,8 @@ func (srv *Server) hs(cn net.Conn) {
 		cn.Close()
 		return
 	}
+	dsA, psA := h.GetFEC()
+	log.Printf("[SRV] +conn cid=%d uid=%s ds=%d ps=%d", h.ClientID, mUID, dsA, psA)
 	s := srv.GetOrCreate(h.ClientID, mUID)
 	sc := s.rs(cn)
 	if sc == nil {
@@ -1342,6 +1345,9 @@ func (srv *Server) hs(cn net.Conn) {
 	for {
 		cn.SetReadDeadline(time.Now().Add(60 * time.Second))
 		if _, e := io.ReadFull(cn, hb); e != nil {
+			if e != io.EOF {
+				log.Printf("[SRV] -conn cid=%d err=%v", s.cid, e)
+			}
 			break
 		}
 		h = DecodeHeader(hb)
@@ -1586,7 +1592,8 @@ func (srv *Server) handleClientFrames(s *Session, pfb *[]byte, d []byte) bool {
 			case s.cs <- struct{}{}:
 				go func(tc2 *targetConn, p []byte) {
 					defer func() { <-s.cs }()
-					srv.hcWithPreReg(s, tc2, p)
+					log.Printf("[SRV] CONNECT cid=%d addr=%s", tc2.id, string(p[:min(len(p),40)]))
+				srv.hcWithPreReg(s, tc2, p)
 				}(tc, f.Payload)
 			default:
 				s.tm.Remove(f.ConnID)
@@ -1595,6 +1602,9 @@ func (srv *Server) handleClientFrames(s *Session, pfb *[]byte, d []byte) bool {
 		case 0x02:
 			if tc, ok := s.tm.Get(f.ConnID); ok && !tc.cl.Load() {
 				tc.touch()
+				if cnt := s.frameCnt.Add(1); cnt%200 == 1 {
+					log.Printf("[SRV] data cid=%d len=%d #%d", f.ConnID, len(f.Payload), cnt)
+				}
 				select {
 				case tc.wc <- f.Payload:
 				default:
@@ -2005,7 +2015,7 @@ func (srv *Server) stcWithMode(s *Session, d []byte, control bool, forceFast boo
 		if len(d) >= 5 {
 			connID = binary.BigEndian.Uint32(d[1:5])
 		}
-		pIdx := int(connID % 4)
+		pIdx := int(connID % 6)
 		if pIdx < len(sts) && sts[pIdx] != nil && !sts[pIdx].IsClosed() {
 			targets = append(targets, sts[pIdx])
 		}
