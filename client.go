@@ -912,7 +912,7 @@ func NewAdaptiveDispatcher(n NodeConfig) *AdaptiveDispatcher {
 		batchActive: make([]bool, DataBuckets),
 		cr:          NewTCPReassembler(cid, 30*time.Second),
 		stopCh:      make(chan struct{}),
-		reasmCh:     make(chan reasmEvent, DataBuckets*4+4),
+		reasmCh:     make(chan reasmEvent, DataBuckets*16+16),
 		pacing:      NewTokenBucket(1<<30, 64<<20), // 濞戞挸绉村﹢顏呮償閺冨倹鏆忛悘鐐插€垮娲焻閻曞倻绀夐悹浣叉櫅缁ㄥ磭浠?TCP/BBRv3 闁煎浜滅换渚€寮ㄩ懜鍨異
 		currentDS:   1,
 		currentPS:   0,
@@ -926,6 +926,9 @@ func NewAdaptiveDispatcher(n NodeConfig) *AdaptiveDispatcher {
 	go ad.pumpReassembler(0, ad.cr, true)
 	go ad.prewarmStreams()
 	go ad.monitorHealth()
+	go ad.handleReassembler()
+	go ad.handleReassembler()
+	go ad.handleReassembler()
 	go ad.handleReassembler()
 	go ad.cleanupProxyConns()
 	return ad
