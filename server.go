@@ -35,8 +35,8 @@ import (
 const (
 	NumStreams       = 6
 	DataBuckets      = 8
-	DataShards       = 3
-	ParityShards     = 3
+	DataShards       = 4
+	ParityShards     = 2
 	MSS              = 1350
 	HeaderSize       = 30
 	Magic            = 0x41455448
@@ -48,7 +48,7 @@ const (
 	ControlFrameFlag = 0x0010
 	FastLaneFlag     = 0x0020
 	NackFlag         = 0x0040
-	ProtocolVersion  = 5
+	ProtocolVersion  = 6
 	AetherALPN       = "http/1.1"
 
 	TargetDialTimeout  = 30 * time.Second
@@ -58,13 +58,13 @@ const (
 
 	SafeMTUPayload       = 1350
 	TCPBufferSize        = 2 << 20
-	MaxReorderWindow     = 8192
+	MaxReorderWindow     = 65536
 	MaxReassemblerBuf    = 64 << 20
 	ReassemblerOutputCap = 2048
 	SmallPacketFastLen   = 1200
 	ReassemblerGapTTL    = 10 * time.Second
 	NackRetryInterval    = 1500 * time.Millisecond
-	NackMaxAttempts      = 3
+	NackMaxAttempts      = 1
 	RetransmitCacheSeqs  = 8192
 	TunnelWriteTimeout   = 5 * time.Second
 	TargetConnIdleTTL    = 5 * time.Minute
@@ -544,6 +544,7 @@ type TCPReassembler struct {
 	lastAdvance     time.Time
 	gapNackSeq      uint32
 	gapNackAttempts int
+	gapStart        time.Time
 	lastNack        time.Time
 }
 
@@ -583,7 +584,7 @@ func (ar *TCPReassembler) AddShard(seqNo uint32, shardIdx uint16, chunkSize uint
 		PutShardPtr(dataPtr)
 		return
 	}
-	if seqNo-ar.nextExpectedSeq > MaxReorderWindow || ar.bufferedBytes > MaxReassemblerBuf {
+	if (seqNo-ar.nextExpectedSeq > MaxReorderWindow && len(ar.readyBuffer) > 100) || ar.bufferedBytes > MaxReassemblerBuf {
 		ar.mu.Unlock()
 		PutShardPtr(dataPtr)
 		log.Printf("[WARN] reassembler overflow: seq=%d expected=%d buffered=%d, rebooting", seqNo, ar.nextExpectedSeq, ar.bufferedBytes)
@@ -773,6 +774,7 @@ func (ar *TCPReassembler) failGapLocked(now time.Time) {
 	ar.initialized = true
 	ar.gapNackSeq = 0
 	ar.gapNackAttempts = 0
+	ar.gapStart = time.Time{}
 	ar.lastNack = time.Time{}
 	ar.lastAdvance = now
 	select {
@@ -801,8 +803,11 @@ func (ar *TCPReassembler) cleanupStale() {
 	if len(ar.readyBuffer) > 0 && n.Sub(ar.lastAdvance) > NackRetryInterval {
 		seq := ar.nextExpectedSeq
 		if ar.gapNackSeq != seq {
+			if ar.gapNackSeq == 0 {
+				ar.gapStart = n
+				ar.gapNackAttempts = 0
+			}
 			ar.gapNackSeq = seq
-			ar.gapNackAttempts = 0
 			ar.lastNack = time.Time{}
 		}
 		if ar.gapNackAttempts < NackMaxAttempts && (ar.lastNack.IsZero() || n.Sub(ar.lastNack) >= NackRetryInterval) {
@@ -816,7 +821,7 @@ func (ar *TCPReassembler) cleanupStale() {
 				log.Printf("[WARN] reassembler gap seq=%d ready=%d buffered=%d; NACK attempt %d/%d", seq, len(ar.readyBuffer), ar.bufferedBytes, ar.gapNackAttempts, NackMaxAttempts)
 			}
 		}
-		if n.Sub(ar.lastAdvance) > ReassemblerGapTTL && ar.gapNackAttempts >= NackMaxAttempts {
+		if !ar.gapStart.IsZero() && n.Sub(ar.gapStart) > ReassemblerGapTTL {
 			log.Printf("[WARN] reassembler gap timeout: expected=%d ready=%d buffered=%d; resetting target data window", ar.nextExpectedSeq, len(ar.readyBuffer), ar.bufferedBytes)
 			ar.failGapLocked(n)
 			} else if len(ar.readyBuffer) > 200 {
@@ -928,8 +933,14 @@ func NewTargetConnManager() *TargetConnManager {
 func (tm *TargetConnManager) Add(id uint32, tc *targetConn) error {
 	tm.mu.Lock()
 	defer tm.mu.Unlock()
-	if tm.cl || len(tm.c) >= MaxConcurrentConns {
-		return fmt.Errorf("err")
+	if tm.cl {
+		return fmt.Errorf("closed")
+	}
+	if _, exists := tm.c[id]; exists {
+		return fmt.Errorf("duplicate")
+	}
+	if len(tm.c) >= MaxConcurrentConns {
+		return fmt.Errorf("capacity")
 	}
 	tm.c[id] = tc
 	return nil
@@ -1355,34 +1366,44 @@ func (srv *Server) hs(cn net.Conn) {
 
 		ss := int((h.ChunkSize + uint32(ds) - 1) / uint32(ds))
 		tl := uint32(ss) + uint32(h.PaddingLen)
-		if tl > MSS+512 {
+		// v6: allow larger packets (up to 8KB) for no-FEC mode
+		if tl > 8192 {
 			break
 		}
 		var bp *[]byte
+		var bigBuf []byte
 		if tl > 0 {
-			bp = GetShardPtr()
+			if int(tl) > MSS+1024 {
+				// v6: large packet, allocate fresh buffer
+				bigBuf = make([]byte, HeaderSize+int(tl))
+				bp = &bigBuf
+			} else {
+				bp = GetShardPtr()
+			}
 			if _, e := io.ReadFull(cn, (*bp)[HeaderSize:HeaderSize+int(tl)]); e != nil {
-				PutShardPtr(bp)
+				if bigBuf == nil {
+					PutShardPtr(bp)
+				}
 				break
 			}
 		}
 		recordTraffic(s.uid, 0, uint64(HeaderSize+tl))
 		s.la.Store(time.Now().Unix())
 		if h.Flags&NackFlag != 0 {
-			if bp != nil {
+			if bp != nil && bigBuf == nil {
 				PutShardPtr(bp)
 			}
 			srv.retransmitSeq(s, h.GetBucket()%DataBuckets, h.SeqNo)
 			continue
 		}
 		if h.Flags&PongFlag != 0 {
-			if bp != nil {
+			if bp != nil && bigBuf == nil {
 				PutShardPtr(bp)
 			}
 			continue
 		}
 		if h.Flags&PingFlag != 0 {
-			pl := generateSmartPadding(HeaderSize)
+			var pl uint16 = 0 // v6: no padding
 			p := &PacketHeader{Magic: Magic, ClientID: h.ClientID, Flags: PongFlag, Timestamp: h.Timestamp, PaddingLen: pl}
 			bo := GetShardPtr()
 			p.EncodeTo((*bo)[:HeaderSize])
@@ -1391,19 +1412,45 @@ func (srv *Server) hs(cn net.Conn) {
 			}
 			sc.Write((*bo)[:HeaderSize+int(pl)])
 			PutShardPtr(bo)
-			if bp != nil {
+			if bp != nil && bigBuf == nil {
 				PutShardPtr(bp)
 			}
 			continue
 		}
-		if bp != nil {
-			*bp = (*bp)[:HeaderSize+ss]
-			if h.Flags&ControlFrameFlag != 0 {
-				s.cr.AddShard(h.SeqNo, h.ShardIdx, h.ChunkSize, bp, ds, ps)
+			if bp != nil {
+			if ds == 1 && ps == 0 {
+				// v6 Split+Mirror: no FEC, direct delivery to frame parser
+				payload := make([]byte, h.ChunkSize)
+				copy(payload, (*bp)[HeaderSize:HeaderSize+int(h.ChunkSize)])
+				if bigBuf == nil {
+					PutShardPtr(bp)
+				}
+				if h.Flags&ControlFrameFlag != 0 {
+					select {
+					case s.reasmCh <- reasmEvent{bucket: 0, control: true, data: payload}:
+					case <-s.cc:
+						sc.Close()
+						return
+					}
+				} else {
+					bucket := h.GetBucket() % DataBuckets
+					s.lastTraffic.Store(time.Now().UnixNano())
+					select {
+					case s.reasmCh <- reasmEvent{bucket: bucket, control: false, data: payload}:
+					case <-s.cc:
+						sc.Close()
+						return
+					}
+				}
 			} else {
-				bucket := h.GetBucket() % DataBuckets
-				s.lastTraffic.Store(time.Now().UnixNano())
-				s.trs[bucket].AddShard(h.SeqNo, h.ShardIdx, h.ChunkSize, bp, ds, ps)
+				*bp = (*bp)[:HeaderSize+ss]
+				if h.Flags&ControlFrameFlag != 0 {
+					s.cr.AddShard(h.SeqNo, h.ShardIdx, h.ChunkSize, bp, ds, ps)
+				} else {
+					bucket := h.GetBucket() % DataBuckets
+					s.lastTraffic.Store(time.Now().UnixNano())
+					s.trs[bucket].AddShard(h.SeqNo, h.ShardIdx, h.ChunkSize, bp, ds, ps)
+				}
 			}
 		}
 	}
@@ -1412,7 +1459,7 @@ func (srv *Server) hs(cn net.Conn) {
 
 func (srv *Server) sendNACK(s *Session, bucket uint8, seq uint32) {
 	sts := s.getStreams()
-	pl := generateSmartPadding(HeaderSize)
+	var pl uint16 = 0 // v6: no padding
 	h := &PacketHeader{Magic: Magic, ClientID: s.cid, SeqNo: seq, Flags: NackFlag, PaddingLen: pl, Timestamp: uint32(time.Now().UnixMilli() & 0xFFFFFFFF)}
 	h.SetBucket(bucket)
 	s.nackScore.Add(1)
@@ -1449,7 +1496,7 @@ func (srv *Server) retransmitSeq(s *Session, bucket uint8, seq uint32) {
 		return
 	}
 	for i, pkt := range pkts {
-		st := streams[i%len(streams)]
+		st := streams[int(seq+uint32(i))%len(streams)]
 		if _, err := st.Write(pkt); err != nil {
 			st.Close()
 		}
@@ -1491,7 +1538,7 @@ func (srv *Server) fdl(s *Session) {
 			return
 		case ev := <-s.reasmCh:
 			if ev.closed {
-				return
+					return
 			}
 			if ev.control {
 				if ev.data == nil {
@@ -1525,6 +1572,9 @@ func (srv *Server) handleClientFrames(s *Session, pfb *[]byte, d []byte) bool {
 	for _, f := range frames {
 		switch f.Type {
 		case 0x01:
+		if _, exists := s.tm.Get(f.ConnID); exists {
+			break
+		}
 			wc := make(chan []byte, 1024)
 			tc := &targetConn{conn: nil, id: f.ConnID, d: make(chan struct{}), wc: wc, tm: s.tm}
 			tc.touch()
@@ -1905,171 +1955,72 @@ func (srv *Server) stcWithMode(s *Session, d []byte, control bool, forceFast boo
 	s.la.Store(time.Now().Unix())
 	s.wm.Lock()
 	defer s.wm.Unlock()
-	o := 0
-	for o < len(d) {
-		if s.ic.Load() {
-			return
-		}
-		sts := s.getStreams()
-		var vs []*SafeConn
-		for _, st := range sts {
-			if st != nil && !st.IsClosed() {
-				vs = append(vs, st)
-			}
-		}
-		if len(vs) == 0 {
-			return
-		}
 
-		var ds, ps int
-		var enc reedsolomon.Encoder
-		var sq uint32
-		var bucket uint8
-		var fastLane bool
-		if control || forceFast {
-			ds, ps = 1, 2
-			enc = getEncoder(ds, ps)
-			if control {
-				sq = s.cfw.Add(1) - 1
-			} else {
-				bucket = muxBucket(d)
-				sq = s.fws[bucket].Add(1) - 1
-				fastLane = true
-			}
+	// v6: Split+Mirror protocol
+
+	sts := s.getStreams()
+	var active []*SafeConn
+	for _, st := range sts {
+		if st != nil && !st.IsClosed() {
+			active = append(active, st)
+		}
+	}
+
+	if len(active) == 0 {
+		return
+	}
+
+	var sq uint32
+	var bucket uint8
+	if control {
+		sq = s.cfw.Add(1) - 1
+	} else {
+		bucket = muxBucket(d)
+		s.lastTraffic.Store(time.Now().UnixNano())
+		sq = s.fws[bucket].Add(1) - 1
+	}
+
+	ts := uint32(time.Now().UnixMilli() & 0xFFFFFFFF)
+	cs := uint32(len(d))
+	var padLen uint16 = 0 // v6: no padding for fast bypass
+	buf := make([]byte, HeaderSize+len(d)+int(padLen))
+
+	h := &PacketHeader{Magic: Magic, ClientID: s.cid, SeqNo: sq, ShardIdx: 0, PaddingLen: padLen, ChunkSize: cs, Timestamp: ts}
+	if control {
+		h.Flags |= ControlFrameFlag
+	}
+	h.SetFEC(1, 0)
+	h.SetBucket(bucket)
+	h.EncodeTo(buf[:HeaderSize])
+	copy(buf[HeaderSize:], d)
+
+	pkt := buf
+
+	// Target streams: control=all, data=primary(connID%4)+mirrors(4,5)
+	var targets []*SafeConn
+	if control {
+		targets = active
+	} else {
+		var connID uint32
+		if len(d) >= 5 {
+			connID = binary.BigEndian.Uint32(d[1:5])
+		}
+		pIdx := int(connID % 4)
+		if pIdx < len(sts) && sts[pIdx] != nil && !sts[pIdx].IsClosed() {
+			targets = append(targets, sts[pIdx])
+		}
+	}
+
+	if len(targets) == 0 {
+		return
+	}
+
+	for _, st := range targets {
+		if _, err := st.Write(pkt); err != nil {
+			st.Close()
 		} else {
-			bucket = muxBucket(d)
-			s.lastTraffic.Store(time.Now().UnixNano())
-			if score := s.nackScore.Load(); score > 0 && fastRand()%64 == 0 {
-				s.nackScore.Store(score * 3 / 4)
-			}
-			s.sdm.RLock()
-			ds, ps = srv.chooseServerDataFEC(s, len(vs), int(s.currentDS), int(s.currentPS), len(d)-o)
-			sq = s.fws[bucket].Add(1) - 1
-			s.sdm.RUnlock()
-			enc = getEncoder(ds, ps)
-			fastLane = ds == 1 && ps >= 2
+			recordTraffic(s.uid, uint64(len(pkt)), 0)
 		}
-		if enc == nil {
-			return
-		}
-		total := ds + ps
-
-		e := o + ds*MSS
-		if e > len(d) {
-			e = len(d)
-		}
-		c := d[o:e]
-		cs := uint32(len(c))
-		ss := int((cs + uint32(ds) - 1) / uint32(ds))
-		if ss > MSS {
-			ss = MSS
-		}
-
-		sh := make([][]byte, total)
-		pt := make([]*[]byte, total)
-
-		for i := 0; i < ds; i++ {
-			sp := GetShardPtr()
-			pt[i] = sp
-			pl := (*sp)[HeaderSize : HeaderSize+ss]
-			for j := range pl {
-				pl[j] = 0
-			}
-			st, en := i*ss, i*ss+ss
-			if st < int(cs) {
-				if en > int(cs) {
-					en = int(cs)
-				}
-				copy(pl, c[st:en])
-			}
-			sh[i] = pl
-		}
-		for i := ds; i < total; i++ {
-			sp := GetShardPtr()
-			pt[i] = sp
-			pl := (*sp)[HeaderSize : HeaderSize+ss]
-			for j := range pl {
-				pl[j] = 0
-			}
-			sh[i] = pl
-		}
-
-		err := enc.Encode(sh)
-		if err != nil {
-			for _, sp := range pt {
-				if sp != nil {
-					PutShardPtr(sp)
-				}
-			}
-			return
-		}
-		ts := uint32(time.Now().UnixMilli() & 0xFFFFFFFF)
-
-		success := 0
-		func(sq, cs, ts uint32, pa []*[]byte, sa [][]byte, v []*SafeConn, ds, ps uint8) {
-			defer func() {
-				for _, sp := range pa {
-					if sp != nil {
-						PutShardPtr(sp)
-					}
-				}
-			}()
-			sf := fastRand() % uint32(len(v))
-			totalShards := int(ds) + int(ps)
-			for i := 0; i < totalShards; i++ {
-				st := v[(uint32(i)+sf)%uint32(len(v))]
-				if st == nil {
-					continue
-				}
-
-				actualChunkSize := HeaderSize + len(sa[i])
-				pl := generateSmartPadding(actualChunkSize)
-
-				h := &PacketHeader{Magic: Magic, ClientID: s.cid, SeqNo: sq, ShardIdx: uint16(i), PaddingLen: pl, ChunkSize: cs, Timestamp: ts}
-				if control {
-					h.Flags |= ControlFrameFlag
-				} else if fastLane {
-					h.Flags |= FastLaneFlag
-				}
-				h.SetFEC(ds, ps)
-				h.SetBucket(bucket)
-				sp := pa[i]
-				h.EncodeTo((*sp)[:HeaderSize])
-				pe := HeaderSize + len(sa[i])
-				pkt := (*sp)[:pe+int(pl)]
-				for j := pe; j < pe+int(pl); j++ {
-					(*sp)[j] = 0
-				}
-				if !control {
-					s.rtx.Store(bucket, sq, uint16(i), pkt)
-				}
-				if n, err := st.Write(pkt); err != nil {
-					// 浠呭畨鍏ㄧЩ闄ら棶棰樻祦锛岄€昏緫灞傜粷瀵归殧绂讳笉褰卞搷涓氬姟
-					st.Close()
-					s.sm.Lock()
-					sts := s.getStreams()
-					for idx, ss := range sts {
-						if ss == st {
-							sts[idx] = nil
-							break
-						}
-					}
-					s.sts.Store(sts)
-					s.sm.Unlock()
-				} else if n == len(pkt) {
-					success++
-					recordTraffic(s.uid, uint64(n), 0)
-				} else {
-					st.Close()
-				}
-			}
-		}(sq, cs, ts, pt, sh, vs, uint8(ds), uint8(ps))
-		if success < ds {
-			log.Printf("[SRV] shard write quorum failed: cid=%d seq=%d success=%d required=%d active=%d", s.cid, sq, success, ds, len(vs))
-			s.Close()
-			return
-		}
-		o = e
 	}
 }
 
@@ -2367,7 +2318,7 @@ func initConfig() {
 		PanelPort:   8080,
 		PanelUser:   "admin",
 		PanelPass:   "admin",
-		ListenPorts: "443,8443",
+		ListenPorts: "8443,8444,8445,8446,8447,8448",
 		CamoMode:    "proxy",
 		CamoTarget:  "www.microsoft.com:443",
 		ApiToken:    fmt.Sprintf("%x", fastRand()),
