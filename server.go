@@ -1067,7 +1067,7 @@ func NewSession(cid uint32, uid string) *Session {
 		fs:          make(chan struct{}, 256),
 		cs:          make(chan struct{}, MaxConcurrentConns),
 		cc:          make(chan struct{}),
-		reasmCh:     make(chan reasmEvent, DataBuckets*16+16),
+		reasmCh:     make(chan reasmEvent, DataBuckets*32+32), // v7.6: larger buffer
 		rtx:         NewRetransmitCache(RetransmitCacheSeqs),
 	}
 	s.sts.Store(make([]*SafeConn, 0, NumStreams))

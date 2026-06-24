@@ -55,12 +55,13 @@ const (
 	MaxReassemblerBuf    = 64 << 20
 	ReassemblerOutputCap = 2048
 	SmallPacketFastLen   = 1200
-	ReassemblerGapTTL    = 10 * time.Second
+	ReassemblerGapTTL    = 2 * time.Second // v7.6: reduced from 10s for faster gap recovery
 	NackRetryInterval    = 1500 * time.Millisecond
-	NackMaxAttempts      = 1
+	NackMaxAttempts      = 3 // v7.6: allow 3 NACK attempts before giving up
 	RetransmitCacheSeqs  = 8192
 	TunnelWriteTimeout   = 5 * time.Second
 	LocalWriteTimeout    = 5 * time.Second
+	ConnectACKTimeout    = 10 * time.Second
 	ProxyIdleTimeout     = 3 * time.Minute
 	LocalReadBufferSize  = 4*MSS - 7
 	DebugLogging         = false
@@ -912,7 +913,7 @@ func NewAdaptiveDispatcher(n NodeConfig) *AdaptiveDispatcher {
 		batchActive: make([]bool, DataBuckets),
 		cr:          NewTCPReassembler(cid, 30*time.Second),
 		stopCh:      make(chan struct{}),
-		reasmCh:     make(chan reasmEvent, DataBuckets*4+4),
+		reasmCh:     make(chan reasmEvent, DataBuckets*32+32), // v7.6: larger buffer
 		pacing:      NewTokenBucket(1<<30, 64<<20), // 濞戞挸绉村﹢顏呮償閺冨倹鏆忛悘鐐插€垮娲焻閻曞倻绀夐悹浣叉櫅缁ㄥ磭浠?TCP/BBRv3 闁煎浜滅换渚€寮ㄩ懜鍨異
 		currentDS:   1,
 		currentPS:   0,
@@ -1809,12 +1810,34 @@ func (c *AdaptiveDispatcher) sendChunk(data []byte, control bool) bool {
 
 	pkt := buf
 
-	// v7.4: CONNECT (cmd=0x01) sent to ONE stream only to avoid server dedup killing the connection.
-	// Other control frames (CLOSE, FIN) still broadcast to all streams for reliability.
+	// v7.6: control=broadcast, CONNECT=healthiest stream, data=connID%6
 	var targets []*SafeStream
 	isConnect := len(data) > 0 && data[0] == 0x01
 	if control && !isConnect {
 		targets = active
+	} else if isConnect {
+		// v7.6: pick stream with lowest RTT for CONNECT
+		c.sMu.RLock()
+		var best *SafeStream
+		var bestRTT int64 = 1<<63 - 1
+		for i := 0; i < len(c.streams) && i < NumStreams; i++ {
+			st := c.streams[i]
+			if st == nil || st.IsClosed() {
+				continue
+			}
+			rtt := st.srtt.Load()
+			if rtt == 0 {
+				rtt = 50 // default 50ms for unknown RTT
+			}
+			if rtt < bestRTT {
+				bestRTT = rtt
+				best = st
+			}
+		}
+		c.sMu.RUnlock()
+		if best != nil {
+			targets = append(targets, best)
+		}
 	} else {
 		var connID uint32
 		if len(data) >= 5 {
@@ -2267,7 +2290,7 @@ func (c *AdaptiveDispatcher) DialProxyTarget(conn net.Conn, addr string, targetP
 			log.Printf("[CLI] CONNECT rejected by server connID=%d", pc.connID)
 			conn.Write(socks5Reply(0x05, nil, 0))
 			return
-		case <-time.After(5 * time.Second):
+		case <-time.After(ConnectACKTimeout):
 			log.Printf("[CLI] CONNECT timeout connID=%d", pc.connID)
 			conn.Write(socks5Reply(0x04, nil, 0))
 			return
