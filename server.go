@@ -1592,7 +1592,14 @@ func (srv *Server) handleClientFrames(s *Session, pfb *[]byte, d []byte) bool {
 			case s.cs <- struct{}{}:
 				go func(tc2 *targetConn, p []byte) {
 					defer func() { <-s.cs }()
-					log.Printf("[SRV] CONNECT cid=%d addr=%s", tc2.id, string(p[:min(len(p),40)]))
+					{
+				a2, pt2, e2 := parseConnectPayload(p)
+				if e2 == nil {
+					log.Printf("[SRV] CONNECT cid=%d addr=%s:%d", tc2.id, a2, pt2)
+				} else {
+					log.Printf("[SRV] CONNECT cid=%d addr=<parse_err> payload=%x", tc2.id, p[:min(len(p),20)])
+				}
+			}
 				srv.hcWithPreReg(s, tc2, p)
 				}(tc, f.Payload)
 			default:
@@ -1679,12 +1686,12 @@ func (srv *Server) hcWithPreReg(s *Session, tc *targetConn, p []byte) {
 	debugf("[SRV] dialing target -> %s", t)
 	cn, e := net.DialTimeout("tcp", t, TargetDialTimeout)
 	if e != nil {
-		debugf("[SRV] dial failed -> %s error: %v", t, e)
+		log.Printf("[SRV] CONNECT FAIL cid=%d target=%s err=%v", tc.id, t, e)
 		s.tm.Remove(tc.id)
 		srv.stc(s, encodeFrame(2, tc.id, nil))
 		return
 	}
-	debugf("[SRV] dial ok -> %s", t)
+	log.Printf("[SRV] CONNECT OK cid=%d target=%s", tc.id, t)
 	if !s.wg.Add() {
 		cn.Close()
 		s.tm.Remove(tc.id)

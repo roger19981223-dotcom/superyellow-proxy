@@ -2259,6 +2259,21 @@ func (c *AdaptiveDispatcher) DialProxyTarget(conn net.Conn, addr string, targetP
 		pc.touch()
 		framePool.Put(fb[:cap(fb)])
 
+		// v7.3: Wait for server CONNECT response before sending SOCKS5 reply
+		select {
+		case <-pc.connectAckCh:
+			// Server confirmed target connection established
+		case <-pc.connectErrCh:
+			// Server rejected the CONNECT
+			return
+		case <-time.After(DialTimeout):
+			// Server didn't respond in time
+			log.Printf("[CLI] CONNECT timeout connID=%d addr=%s:%d", pc.connID, addr, targetPort)
+			return
+		case <-pc.done:
+			return
+		}
+
 		if writeOK != nil && !writeOK() {
 			return
 		}
