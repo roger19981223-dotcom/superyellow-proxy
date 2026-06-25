@@ -1,4 +1,4 @@
-//go:build !js
+﻿//go:build !js
 
 package main
 
@@ -894,7 +894,7 @@ type AdaptiveDispatcher struct {
 	batchMu         sync.Mutex
 	batchBufs       [][]byte
 	batchActive     []bool
-	// 闂佹彃绉风换娑㈠箳瑜嶉崺?	lastReconnect    time.Time
+	// 闂備焦褰冪粔椋庢崲濞戙垹绠崇憸宥夊春?	lastReconnect    time.Time
 	reconnectBackoff time.Duration
 	reconnectMu      sync.Mutex
 	closed           atomic.Bool
@@ -914,7 +914,7 @@ func NewAdaptiveDispatcher(n NodeConfig) *AdaptiveDispatcher {
 		cr:          NewTCPReassembler(cid, 30*time.Second),
 		stopCh:      make(chan struct{}),
 		reasmCh:     make(chan reasmEvent, DataBuckets*32+32), // v7.6: larger buffer
-		pacing:      NewTokenBucket(1<<30, 64<<20), // 濞戞挸绉村﹢顏呮償閺冨倹鏆忛悘鐐插€垮娲焻閻曞倻绀夐悹浣叉櫅缁ㄥ磭浠?TCP/BBRv3 闁煎浜滅换渚€寮ㄩ懜鍨異
+		pacing:      NewTokenBucket(1<<30, 64<<20), // 婵炴垶鎸哥粔鏉戯耿椤忓懏鍎熼柡鍐ㄥ€归弳蹇涙倶閻愭彃鈧灝顬婂ú顏呯劵闁绘洖鍊荤粈澶愭偣娴ｅ弶娅呯紒銊ョ－娴?TCP/BBRv3 闂佺厧顨庢禍婊呮崲娓氣偓瀵劑鎳滈崹顐ｇ暟
 		currentDS:   1,
 		currentPS:   0,
 		rtx:         NewRetransmitCache(RetransmitCacheSeqs),
@@ -991,7 +991,7 @@ func (c *AdaptiveDispatcher) reboot() {
 	if c.closed.Load() {
 		return
 	}
-	log.Printf("[CLI] 妫ｅ啯鏆?鐎殿喗娲橀幖鎼佹⒐閹稿孩顦ч梻鍌涙綑娴犵姴顭ㄩ悙鏉戠仐闁轰胶澧楀畵浣该规担宄扮船闂佹彃绉靛畷顖炲锤韫囥儳绀夐柟绗涘棭鏀介悗鐟邦槸閸欏繘鎮滈銏犳闁?..")
+	log.Printf("[CLI] 濡絽鍟弳?閻庢鍠楀ú姗€骞栭幖浣光拹闁圭瀛╅ˇ褔姊婚崒娑欑稇濞寸姷濮撮…銊╂倷閺夋垹浠愰梺杞拌兌婢ф鐣垫担璇ヨ鎷呭畡鎵埞闂備焦褰冪粔闈涚暦椤栫偛閿ら煫鍥ュ劤缁€澶愭煙缁楁稑妫弨浠嬫倵閻熼偊妲搁柛娆忕箻閹粓顢橀姀鐘愁仧闂?..")
 	c.Close()
 	go func() {
 		time.Sleep(500 * time.Millisecond)
@@ -1001,7 +1001,7 @@ func (c *AdaptiveDispatcher) reboot() {
 
 func (c *AdaptiveDispatcher) Close() {
 	if c.closed.Swap(true) {
-		return // 鐎规瓕灏欑划锟犲礂閹惰姤锛旈柨娑樼焸濡茶顫?double-close panic
+		return // 閻庤鐡曠亸娆戝垝閿熺姴绀傞柟鎯板Г閿涙棃鏌ㄥ☉妯肩劯婵¤尪顕ч～?double-close panic
 	}
 	select {
 	case <-c.stopCh:
@@ -1066,6 +1066,48 @@ func TuneTCPConn(conn net.Conn) {
 		tc.SetKeepAlivePeriod(15 * time.Second)
 	}
 }
+
+// applySystemTCPTuning applies kernel-level TCP optimizations on Linux.
+// Only runs when AETHER_TCP_TUNE=1 is set (opt-in, since this modifies host kernel params).
+// Useful for --network host Docker containers or bare-metal installs.
+func applySystemTCPTuning() {
+	if runtime.GOOS != "linux" {
+		return
+	}
+	if os.Getenv("AETHER_TCP_TUNE") != "1" {
+		return
+	}
+	type kv struct{ path, val string }
+	tunables := []kv{
+		{"/proc/sys/net/core/rmem_max", "16777216"},
+		{"/proc/sys/net/core/wmem_max", "16777216"},
+		{"/proc/sys/net/ipv4/tcp_rmem", "4096 131072 16777216"},
+		{"/proc/sys/net/ipv4/tcp_wmem", "4096 65536 16777216"},
+		{"/proc/sys/net/core/default_qdisc", "fq"},
+		{"/proc/sys/net/ipv4/tcp_congestion_control", "bbr"},
+		{"/proc/sys/net/ipv4/tcp_fastopen", "3"},
+		{"/proc/sys/net/ipv4/tcp_mtu_probing", "1"},
+		{"/proc/sys/net/ipv4/tcp_slow_start_after_idle", "0"},
+		{"/proc/sys/net/ipv4/tcp_no_metrics_save", "1"},
+		{"/proc/sys/net/ipv4/tcp_sack", "1"},
+		{"/proc/sys/net/ipv4/tcp_dsack", "1"},
+		{"/proc/sys/net/ipv4/tcp_fack", "1"},
+		{"/proc/sys/net/ipv4/tcp_window_scaling", "1"},
+		{"/proc/sys/net/ipv4/tcp_timestamps", "1"},
+		{"/proc/sys/net/core/somaxconn", "4096"},
+		{"/proc/sys/net/core/netdev_max_backlog", "5000"},
+	}
+	applied := 0
+	for _, t := range tunables {
+		if err := os.WriteFile(t.path, []byte(t.val), 0644); err == nil {
+			applied++
+		}
+	}
+	if applied > 0 {
+		log.Printf("[CLI] TCP tuning applied (%d/%d ok)", applied, len(tunables))
+	}
+}
+
 
 func normalizeFingerprint(s string) string {
 	s = strings.ToLower(strings.TrimSpace(s))
@@ -1763,7 +1805,7 @@ func (c *AdaptiveDispatcher) sendChunk(data []byte, control bool) bool {
 	c.muxWriteMu.Lock()
 	defer c.muxWriteMu.Unlock()
 
-	// v6: Split+Mirror — no FEC, primary + mirror streams
+	// v6: Split+Mirror 鈥?no FEC, primary + mirror streams
 
 	c.sMu.RLock()
 	var active []*SafeStream
@@ -2539,6 +2581,7 @@ func main() {
 	runtime.GOMAXPROCS(runtime.NumCPU())
 	debug.SetGCPercent(200)
 	localProxyAddr := flag.String("listen", "0.0.0.0:11080", "SOCKS5/HTTP local proxy listen address")
+	applySystemTCPTuning()
 	panelPort := flag.String("panel", "0.0.0.0:9999", "Web panel listen address")
 	cfgFile := flag.String("config", "aether_client.json", "Config file path")
 	flag.Parse()
@@ -2619,35 +2662,35 @@ body{background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSy
 <div class="c">
   <div class="hd">
     <div><h1 id="title">&#128992; SuperYellow Proxy</h1><div class="sub">SOCKS5/HTTP Gateway over Aether FEC</div></div>
-    <div><button id="toggleBtn" class="btn btn-gn" onclick="toggle()">&#9654; 闁告凹鍨版慨鈺侇嚕閺囩喐鎯?/button></div>
+    <div><button id="toggleBtn" class="btn btn-gn" onclick="toggle()">&#9654; 闂佸憡鍑归崹鐗堟叏閳轰緡鍤曢柡鍥╁枑閹?/button></div>
   </div>
 
   <div class="sb">
-    <div class="st"><div class="lb">鐎殿喗娲橀幖鎼佹偐閼哥鍋?/div><div class="vl" id="s1">-</div></div>
-    <div class="st"><div class="lb">闁煎搫鍊婚崑锝夊极娴兼潙娅?/div><div class="vl ac" id="s2">-</div></div>
-    <div class="st"><div class="lb">鐟滅増鎸告晶鐘绘嚍閸屾粌浠?/div><div class="vl" id="s3" style="font-size:15px">-</div></div>
-    <div class="st"><div class="lb">闁哄牜鍓欏﹢瀵哥博椤栨艾缍?/div><div class="vl" style="font-size:15px;font-family:monospace">:11080</div></div>
+    <div class="st"><div class="lb">閻庢鍠楀ú姗€骞栭幖浣瑰亹闁煎摜顣介崑?/div><div class="vl" id="s1">-</div></div>
+    <div class="st"><div class="lb">闂佺厧鎼崐濠氬磻閿濆鏋佸ù鍏兼綑濞?/div><div class="vl ac" id="s2">-</div></div>
+    <div class="st"><div class="lb">閻熸粎澧楅幐鍛婃櫠閻樼粯鍤嶉柛灞剧矊娴?/div><div class="vl" id="s3" style="font-size:15px">-</div></div>
+    <div class="st"><div class="lb">闂佸搫鐗滈崜娆忥耿鐎靛摜鍗氭い鏍ㄨ壘缂?/div><div class="vl" style="font-size:15px;font-family:monospace">:11080</div></div>
   </div>
 
   <div class="cr">
     <div class="tb">
-      <h2>&#128225; 闁煎搫鍊婚崑锝夊礆濡ゅ嫨鈧?/h2>
+      <h2>&#128225; 闂佺厧鎼崐濠氬磻閿濆绀嗘俊銈呭閳?/h2>
       <div class="cg">
-        <button class="btn btn-g btn-sm" onclick="copyLocalProxy()">&#128279; 濠㈣泛绉撮崺妤呭箳閵夈儱寮?/button>
-        <button class="btn btn-g btn-sm" onclick="copyJson()">&#128203; 濠㈣泛绉撮崺妤呮煀瀹ュ洨鏋?/button>
-        <button class="btn btn-p btn-sm" onclick="openModal(null)">+ 婵烇綀顕ф慨鐐烘嚍閸屾粌浠?/button>
+        <button class="btn btn-g btn-sm" onclick="copyLocalProxy()">&#128279; 婵犮垼娉涚粔鎾春濡ゅ懎绠抽柕澶堝劚瀵?/button>
+        <button class="btn btn-g btn-sm" onclick="copyJson()">&#128203; 婵犮垼娉涚粔鎾春濡ゅ懏鐓€鐎广儱娲ㄩ弸?/button>
+        <button class="btn btn-p btn-sm" onclick="openModal(null)">+ 濠电儑缍€椤曆勬叏閻愮儤鍤嶉柛灞剧矊娴?/button>
       </div>
     </div>
     <div class="nl" id="nodeList"></div>
   </div>
 
   <div class="cr">
-    <h2>&#128214; 濞达綀娉曢弫銈囨嫚鐎涙ɑ顫?/h2>
+    <h2>&#128214; 婵炶揪缍€濞夋洟寮妶鍥ㄥ珰閻庢稒蓱椤?/h2>
     <div style="color:var(--text2);font-size:14px;line-height:1.8">
-      <p>1. 闁绘劗鎳撻崵顕€濡? 婵烇綀顕ф慨鐐烘嚍閸屾粌浠柕鍡楃Т閿濈偤宕楅妷銈囩☉闁?SuperYellow 闁哄牆绉存慨鐔煎闯閵娿倓绻嗛柟?/p>
-      <p>2. 闂侇偄顦懙鎴︽嚍閸屾粌浠柛姘嚱缁辨繈宕滃鍛獢 <strong style="color:var(--text)">PassWall 闁?闁煎搫鍊婚崑锝夊礆濡ゅ嫨鈧?/strong> 闂侇偄顦扮€氥劑濡寸€涚灝perYellow闁?/p>
-      <p>3. 閻?PassWall 闁?TCP 婵☆垪鈧磭纭€閻犱礁褰炵拹鐔煎Υ鐏炵厧鈻忛柣顫妼閸亞鎮伴妸銉▎濞寸媴绲块幃濠囧Υ瀹ュ懎绁柛?/p>
-      <p style="margin-top:8px;color:var(--accent)">&#128161; 闁哄牆绉存慨鐔煎闯閵娾晜浠橀悷鏇氱閸樻盯宕?Web 闂傚牄鍨哄妯衡枖閵娿儱鏂€闁活潿鍔嶉崺娑㈠箥瀹ュ牆鍘撮弶鈺冨仦鐢?/p>
+      <p>1. 闂佺粯鍔楅幊鎾诲吹椤曗偓婵? 濠电儑缍€椤曆勬叏閻愮儤鍤嶉柛灞剧矊娴狀垶鏌曢崱妤冃㈤柨婵堝仱瀹曟濡烽妶鍥┾槈闂?SuperYellow 闂佸搫鐗嗙粔瀛樻叏閻旂厧闂柕濞垮€撶换鍡涙煙?/p>
+      <p>2. 闂備緡鍋勯ˇ顕€鎳欓幋锔藉殟闁稿本绮屾禒顖炴煕濮橆剙鍤辩紒杈ㄧ箞瀹曟粌顓奸崨顖滅崲 <strong style="color:var(--text)">PassWall 闂?闂佺厧鎼崐濠氬磻閿濆绀嗘俊銈呭閳?/strong> 闂備緡鍋勯ˇ鎵偓姘ュ姂婵″鈧稓鐏漰erYellow闂?/p>
+      <p>3. 闁?PassWall 闂?TCP 濠碘槅鍨埀顒€纾涵鈧柣鐘辩瑜扮偟鎷归悢鐓幬ラ悘鐐靛帶閳诲繘鏌ｉ～顒€濡奸柛顭戜簽閹即濡搁妷顔解枎婵炲濯寸徊鍧楀箖婵犲洤违鐎广儱鎳庣粊顕€鏌?/p>
+      <p style="margin-top:8px;color:var(--accent)">&#128161; 闂佸搫鐗嗙粔瀛樻叏閻旂厧闂柕濞炬櫆娴犳﹢鎮烽弴姘鳖槮闁告ɑ鐩畷?Web 闂傚倸鐗勯崹鍝勵熆濡　鏋栭柕濞垮劚閺傗偓闂佹椿娼块崝宥夊春濞戙垹绠ョ€广儱鐗嗛崢鎾级閳哄啫浠﹂悽?/p>
     </div>
   </div>
 </div>
@@ -2655,17 +2698,17 @@ body{background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSy
 <!-- Modal -->
 <div class="mm" id="modal" onclick="if(event.target===this)closeModal()">
   <div class="md">
-    <h3 id="modalTitle">婵烇綀顕ф慨鐐烘嚍閸屾粌浠?/h3>
-    <div class="fg"><label>闁煎搫鍊婚崑锝夊触瀹ュ泦?/label><input id="fName" placeholder="濞撴艾顑戠槐浼村箣閹寸姵鐣遍柡鍫濈Т婵喖宕?></div>
-    <div class="fg"><label>闁哄牆绉存慨鐔煎闯閵娿儲鍕鹃柛褉鍋?(IP:缂佹棏鍨拌ぐ?</label><input id="fServer" placeholder="濞撴艾顑戠槐?.2.3.4:8443" style="font-family:monospace"></div>
+    <h3 id="modalTitle">濠电儑缍€椤曆勬叏閻愮儤鍤嶉柛灞剧矊娴?/h3>
+    <div class="fg"><label>闂佺厧鎼崐濠氬磻閿濆瑙︾€广儱娉?/label><input id="fName" placeholder="婵炴挻鑹鹃鎴犳娴兼潙绠ｉ柟瀵稿У閻ｉ亶鏌￠崼婵埿㈠┑顔惧枛瀹?></div>
+    <div class="fg"><label>闂佸搫鐗嗙粔瀛樻叏閻旂厧闂柕濞垮劜閸曢箖鏌涜閸?(IP:缂備焦妫忛崹鎷屻亹?</label><input id="fServer" placeholder="婵炴挻鑹鹃鎴犳?.2.3.4:8443" style="font-family:monospace"></div>
     <div class="fr">
-      <div class="fg"><label>闁活潿鍔嶉崺娑㈠触?/label><input id="fUser" placeholder="Default"></div>
-      <div class="fg"><label>閻庨潧妫涢悥?/label><input id="fPass" type="password" placeholder="闂佹潙鐡ㄥ鍫⑩偓闈涙閹?></div>
+      <div class="fg"><label>闂佹椿娼块崝宥夊春濞戙垹瑙?/label><input id="fUser" placeholder="Default"></div>
+      <div class="fg"><label>闁诲酣娼уΛ娑㈡偉?/label><input id="fPass" type="password" placeholder="闂備焦娼欓悺銊ヮ焽閸懇鍋撻棃娑欘棦闁?></div>
     </div>
-    <div class="fg"><label>SNI (濞寸⒈浜ｉˉ濠囧春閻旈攱鍊?</label><input id="fSni" placeholder="濞撴艾顑戠槐鐧県aofanbox.top" style="font-family:monospace"></div>
+    <div class="fg"><label>SNI (婵炲鈷堟禍锝壦夋繝鍥ф槬闁绘棃鏀遍崐?</label><input id="fSni" placeholder="婵炴挻鑹鹃鎴犳閻х湆aofanbox.top" style="font-family:monospace"></div>
     <div class="ma">
-      <button class="btn btn-g" onclick="closeModal()">闁告瑦鐗楃粔?/button>
-      <button class="btn btn-p" onclick="saveNode()">濞ｅ洦绻傞悺?/button>
+      <button class="btn btn-g" onclick="closeModal()">闂佸憡鐟﹂悧妤冪矓?/button>
+      <button class="btn btn-p" onclick="saveNode()">婵烇絽娲︾换鍌炴偤?/button>
     </div>
   </div>
 </div>
@@ -2689,29 +2732,29 @@ function render(){
   var dot=document.getElementById('title');
   dot.innerHTML='<span style="display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:8px;background:'+(running?'#22c55e;box-shadow:0 0 10px rgba(34,197,94,.6)':'#ef4444')+'"></span>SuperYellow Proxy';
 
-  document.getElementById('s1').innerHTML=running?'<span class="on">閺夆晜鍔橀、鎴炵▔?/span>':'<span class="off">鐎瑰憡褰冩禒鐘差潰?/span>';
+  document.getElementById('s1').innerHTML=running?'<span class="on">闁哄鏅滈崝姗€銆侀幋鐐碘枖?/span>':'<span class="off">閻庣懓鎲¤ぐ鍐╃閻樺樊娼?/span>';
   document.getElementById('s2').textContent=conf.nodes.length;
   var an=conf.nodes.find(function(n){return n.id===conf.active_node_id});
-  document.getElementById('s3').textContent=an?an.name:'闁哄牜浜埀顒€顦扮€?;
+  document.getElementById('s3').textContent=an?an.name:'闂佸搫鐗滄禍顏堝焵椤掆偓椤︽壆鈧?;
 
   var btn=document.getElementById('toggleBtn');
-  if(running){btn.className='btn btn-r';btn.innerHTML='&#9632; 闁稿绮嶉娑橆嚕閺囩喐鎯?}
-  else{btn.className='btn btn-gn';btn.innerHTML='&#9654; 闁告凹鍨版慨鈺侇嚕閺囩喐鎯?}
+  if(running){btn.className='btn btn-r';btn.innerHTML='&#9632; 闂佺顑嗙划宥夘敆濞戞﹩鍤曢柡鍥╁枑閹?}
+  else{btn.className='btn btn-gn';btn.innerHTML='&#9654; 闂佸憡鍑归崹鐗堟叏閳轰緡鍤曢柡鍥╁枑閹?}
 
   var list=document.getElementById('nodeList');
   if(conf.nodes.length===0){
-    list.innerHTML='<div class="emp"><div style="font-size:32px;margin-bottom:8px">&#128225;</div>閺夆晜蓱閻ュ懘寮垫径鎰赋缂傚喚鍠涙俊顓㈡倷閻у摜绀夐柣鎰嚀閸ゎ噣宕ｉ崗鍛憪閻熸瑦甯囬埀? 婵烇綀顕ф慨鐐烘嚍閸屾粌浠柕鍡楃Т缁辨垶鎱?/div>';
+    list.innerHTML='<div class="emp"><div style="font-size:32px;margin-bottom:8px">&#128225;</div>闁哄鏅滆摫闁汇儱鎳樺鍨緞閹邦剙璧嬬紓鍌氬枤閸犳稒淇婇銏″€烽柣褍鎽滅粈澶愭煟閹邦喗鍤€闁搞値鍣ｅ畷锝夊礂閸涱垳鎲柣鐔哥懄鐢洭鍩€? 濠电儑缍€椤曆勬叏閻愮儤鍤嶉柛灞剧矊娴狀垶鏌曢崱妤冃㈢紒杈ㄥ灦閹?/div>';
     return;
   }
   var h='';
   conf.nodes.forEach(function(n){
     var act=n.id===conf.active_node_id;
     h+='<div class="nd'+(act?' act':'')+'" onclick="selectNode(\''+n.id+'\')">';
-    h+='<div><div class="nm">'+esc(n.name)+(act?'<span class="badge">鐟滅増鎸告晶?/span>':'')+'</div>';
+    h+='<div><div class="nm">'+esc(n.name)+(act?'<span class="badge">閻熸粎澧楅幐鍛婃櫠?/span>':'')+'</div>';
     h+='<div class="ad">'+esc(n.server)+' &middot; '+esc(n.username)+'</div></div>';
     h+='<div class="acts">';
-    h+='<button class="btn btn-g btn-sm" onclick="event.stopPropagation();openModal(\''+n.id+'\')">&#9998; 缂傚倹鐗炵欢?/button>';
-    h+='<button class="btn btn-d btn-sm" onclick="event.stopPropagation();delNode(\''+n.id+'\')">&#128465; 闁告帞濞€濞?/button>';
+    h+='<button class="btn btn-g btn-sm" onclick="event.stopPropagation();openModal(\''+n.id+'\')">&#9998; 缂傚倸鍊归悧鐐垫?/button>';
+    h+='<button class="btn btn-d btn-sm" onclick="event.stopPropagation();delNode(\''+n.id+'\')">&#128465; 闂佸憡甯炴繛鈧繛?/button>';
     h+='</div></div>';
   });
   list.innerHTML=h;
@@ -2740,14 +2783,14 @@ function openModal(id){
   if(id){
     var n=conf.nodes.find(function(x){return x.id===id});
     if(!n)return;
-    document.getElementById('modalTitle').textContent='缂傚倹鐗炵欢顐︽嚍閸屾粌浠?;
+    document.getElementById('modalTitle').textContent='缂傚倸鍊归悧鐐垫椤愶附鍤嶉柛灞剧矊娴?;
     document.getElementById('fName').value=n.name;
     document.getElementById('fServer').value=n.server;
     document.getElementById('fUser').value=n.username;
     document.getElementById('fPass').value=n.password;
     document.getElementById('fSni').value=n.sni||'';
   }else{
-    document.getElementById('modalTitle').textContent='婵烇綀顕ф慨鐐烘嚍閸屾粌浠?;
+    document.getElementById('modalTitle').textContent='濠电儑缍€椤曆勬叏閻愮儤鍤嶉柛灞剧矊娴?;
     document.getElementById('fName').value='';
     document.getElementById('fServer').value='';
     document.getElementById('fUser').value='Default';
@@ -2763,7 +2806,7 @@ function closeModal(){document.getElementById('modal').className='mm'}
 function saveNode(){
   var name=document.getElementById('fName').value.trim();
   var server=document.getElementById('fServer').value.trim();
-  if(!name||!server){alert('闁告艾绉惰ⅷ闁告粌鏈﹢鍥礉閳ヨ櫕鐝ら柛锔芥緲濞煎啯绋夊鍫濆幋濞戞捁娅ｉ埞?);return}
+  if(!name||!server){alert('闂佸憡鑹剧粔鎯扳叿闂佸憡绮岄張顒€锕㈤崶顒€绀夐柍銉ㄦ珪閻濄倝鏌涢敂鑺ョ凡婵炵厧鍟粙澶婎吋閸繂骞嬫繛鎴炴崄濞咃綁鍩?);return}
   var obj={
     name:name,server:server,
     username:document.getElementById('fUser').value.trim()||'Default',
@@ -2778,24 +2821,24 @@ function saveNode(){
     conf.nodes.push(obj);
     if(conf.nodes.length===1)conf.active_node_id=obj.id;
   }
-  closeModal();save();showToast('鐎规瓕寮撶换姘扁偓?);
+  closeModal();save();showToast('閻庤鐡曞鎾舵崲濮樻墎鍋?);
 }
 
 function delNode(id){
   var n=conf.nodes.find(function(x){return x.id===id});
-  if(!confirm('缁绢収鍠栭悾楣冨礆閻樼粯鐝熼柕?+(n?n.name:'')+'闁靛棗绋勭槐?))return;
+  if(!confirm('缂佺虎鍙庨崰鏍偩妤ｅ啫绀嗛柣妯肩帛閻濈喖鏌?+(n?n.name:'')+'闂侀潧妫楃粙鍕?))return;
   conf.nodes=conf.nodes.filter(function(x){return x.id!==id});
   if(conf.active_node_id===id)conf.active_node_id=conf.nodes.length?conf.nodes[0].id:'';
-  save();showToast('鐎瑰憡褰冮崹褰掓⒔?);
+  save();showToast('閻庣懓鎲¤ぐ鍐垂瑜版帗鈷?);
 }
 
 function copyLocalProxy(){
   copyText('SOCKS5 / HTTP CONNECT\nHost: 127.0.0.1\nPort: 11080\nAuth: none\nPassWall node type: Socks or HTTP');
-  showToast('闁哄牜鍓欏﹢鎾箳閵夈儱寮冲ǎ鍥ｅ墲娴煎懎顔忛幓鎺濇Щ闁?);
+  showToast('闂佸搫鐗滈崜娆忥耿閹绢喖绠抽柕澶堝劚瀵啿菐閸ワ絽澧插ù鐓庢噹椤斿繘骞撻幒婵囆╅梺?);
 }
 
 function copyJson(){
-  copyText(JSON.stringify(conf,null,2));showToast('闂佹澘绉堕悿?JSON 鐎瑰憡褰冮ˇ鏌ュ礆?);
+  copyText(JSON.stringify(conf,null,2));showToast('闂備焦婢樼粔鍫曟偪?JSON 閻庣懓鎲¤ぐ鍐囬弻銉ョ?);
 }
 
 function copyText(t){
